@@ -1,0 +1,8 @@
+# Line endings in the repository and in checkouts are LF (the self-test compares files
+# byte by byte; otherwise the Windows runner in GitHub Actions would turn them into CRLF).
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary

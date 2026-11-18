@@ -1,0 +1,15 @@
+# Build output and caches (everything stays inside the project, see scripts\env.ps1)
+/target/
+/dist/
+/.toolcache/
+
+# Settings of a portable copy next to the exe
+data/
+
+# Temporary files of the program and the self-test
+*.vmd-tmp
+*.selftest.log
+
+# Private: the assistant's memory and the owner's workstation rules
+/.claude/
+/CLAUDE.md

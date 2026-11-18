@@ -1,0 +1,5 @@
+[target.x86_64-pc-windows-msvc]
+# crt-static: the exe does not need the VC++ Redistributable (no vcruntime140.dll)
+# control-flow-guard: protection against control-flow hijacking (CFG)
+# Delay-loaded DLLs are configured in build.rs (for the exe only).
+rustflags = ["-C", "target-feature=+crt-static", "-C", "control-flow-guard"]

@@ -1,0 +1,109 @@
+# Release: tag vX.Y.Z (matching version in Cargo.toml) → build, tests, installer,
+# zip, checksums, licenses → a GitHub release described by CHANGELOG.md.
+#
+# The exe is built here, from the tagged sources — not on someone's computer. The build
+# (where third-party crate build scripts run) has no write access to the repository;
+# a separate job that builds nothing publishes the release. The origin of the files is
+# attested by GitHub: gh attestation verify <file> -R SiTiROS/vibe-md-viewer
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and verify
+    runs-on: windows-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write      # build provenance attestation
+      attestations: write
+    env:
+      TAG: ${{ github.ref_name }}
+    outputs:
+      ver: ${{ steps.ver.outputs.ver }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust stable
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Tag matches the version
+        id: ver
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($env:TAG -ne "v$ver") { throw "Tag $env:TAG does not match version v$ver in Cargo.toml" }
+          "VER=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ver=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Tests, build, package
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/package.ps1
+
+      - name: Self-test on a live window
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/selftest.ps1 -Exe dist/vibe-md-viewer.exe
+
+      - name: Release notes from CHANGELOG.md
+        shell: pwsh
+        run: |
+          $text = [IO.File]::ReadAllText('CHANGELOG.md', [Text.Encoding]::UTF8)
+          $m = [regex]::Match($text, "(?ms)^## $([regex]::Escape($env:VER))\b.*?\r?\n(.*?)(?=^## |\z)")
+          $notes = if ($m.Success) { $m.Groups[1].Value.Trim() } else { "See CHANGELOG.md" }
+          $notes += "`n`n---`nInstall: download ``vibe-md-viewer-$env:VER-setup.exe`` and run it. Checksums are in ``vibe-md-viewer-$env:VER.sha256.txt``; verify the origin of the file: ``gh attestation verify vibe-md-viewer-$env:VER-setup.exe -R SiTiROS/vibe-md-viewer``. Russian changelog: https://github.com/SiTiROS/vibe-md-viewer/blob/main/CHANGELOG.ru.md"
+          New-Item -ItemType Directory -Force out | Out-Null
+          [IO.File]::WriteAllText('out/release-notes.md', $notes, (New-Object Text.UTF8Encoding $false))
+          Copy-Item "dist/vibe-md-viewer-$env:VER-setup.exe", "dist/vibe-md-viewer-$env:VER.zip", "dist/vibe-md-viewer-$env:VER.sha256.txt", "dist/THIRD-PARTY-NOTICES.txt" out/
+
+      - name: Build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            out/*.exe
+            out/*.zip
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: out/
+          retention-days: 3
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      VER: ${{ needs.build.outputs.ver }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: out
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$TAG" \
+            "out/vibe-md-viewer-$VER-setup.exe" \
+            "out/vibe-md-viewer-$VER.zip" \
+            "out/vibe-md-viewer-$VER.sha256.txt" \
+            "out/THIRD-PARTY-NOTICES.txt" \
+            --title "vibe-md-viewer $VER" --notes-file out/release-notes.md
