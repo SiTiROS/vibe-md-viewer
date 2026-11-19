@@ -198,25 +198,38 @@ pub fn fetch(url: &str, max: usize) -> Result<Vec<u8>, String> {
         let _ = WinHttpSetTimeouts(session.0, 5000, 7000, 10000, 15000);
         let policy = WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH.to_ne_bytes();
         let _ = WinHttpSetOption(Some(session.0), WINHTTP_OPTION_AUTOLOGON_POLICY, Some(&policy));
-
-        let mut current = url.to_string();
-        let mut was_secure = current.to_ascii_lowercase().starts_with("https://");
-        // Overall time limit per image: a slow server cannot occupy the threads for long.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        for _ in 0..=MAX_REDIRECTS {
-            let p = crack(&current)?;
-            if was_secure && !p.secure {
-                return Err(tr!("redirect from https to http is not allowed", "редирект с https на http запрещён").into());
-            }
-            was_secure = p.secure;
-            check_host(&p.host, p.port)?;
-            match fetch_once(&session, &p, max, deadline)? {
-                Step::Body(b) => return Ok(b),
-                Step::Redirect(loc) => current = resolve_location(&current, &loc),
-            }
-        }
-        Err(tr!("too many redirects", "слишком много перенаправлений").into())
+        fetch_with(&session, url, max, check_host)
     }
+}
+
+/// The request loop of `fetch`. Every step — the address itself and each redirect — is
+/// requested without its `#fragment`, must not go from https to http and must pass `check`
+/// (always `check_host` in the program; tests on the loopback interface pass their own).
+unsafe fn fetch_with(session: &H, url: &str, max: usize, check: fn(&str, u16) -> Result<(), String>) -> Result<Vec<u8>, String> {
+    let mut current = url.to_string();
+    let mut was_secure = current.to_ascii_lowercase().starts_with("https://");
+    // Overall time limit per image: a slow server cannot occupy the threads for long.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    for _ in 0..=MAX_REDIRECTS {
+        let p = crack(without_fragment(&current))?;
+        if was_secure && !p.secure {
+            return Err(tr!("redirect from https to http is not allowed", "редирект с https на http запрещён").into());
+        }
+        was_secure = p.secure;
+        check(&p.host, p.port)?;
+        match fetch_once(session, &p, max, deadline)? {
+            Step::Body(b) => return Ok(b),
+            Step::Redirect(loc) => current = resolve_location(&current, &loc),
+        }
+    }
+    Err(tr!("too many redirects", "слишком много перенаправлений").into())
+}
+
+/// The address without its `#fragment`. The fragment is for the client only; WinHTTP would send
+/// it to the server percent-encoded as part of the path (`a.png#f` → `GET /a.png%23f`). Cutting
+/// at the first `#` also matches where `links::classify` ends the host.
+fn without_fragment(url: &str) -> &str {
+    url.split_once('#').map_or(url, |(u, _)| u)
 }
 
 unsafe fn fetch_once(session: &H, p: &Parsed, max: usize, deadline: std::time::Instant) -> Result<Step, String> {
@@ -309,6 +322,304 @@ mod tests {
         assert_eq!(resolve_location("https://a.com/x/y.png", "z.png"), "https://a.com/x/z.png");
         assert_eq!(resolve_location("https://a.com/x/y.png", "//b.com/q"), "https://b.com/q");
         assert_eq!(resolve_location("https://a.com/x", "http://192.168.0.1/"), "http://192.168.0.1/");
+    }
+
+    #[test]
+    fn private_ip_ranges() {
+        let v4 = |s: &str| is_private_ip(IpAddr::V4(s.parse().unwrap()));
+        for ip in [
+            "0.1.2.3", "10.255.0.1", "100.64.0.0", "100.127.255.255", "127.255.255.254", "169.254.169.254", "172.16.0.1", "172.31.9.9",
+            "192.168.0.1", "198.18.0.1", "198.19.255.255", "224.0.0.251", "239.1.1.1", "240.0.0.1", "255.255.255.255",
+        ] {
+            assert!(v4(ip), "{ip}");
+        }
+        for ip in ["1.1.1.1", "8.8.8.8", "100.63.255.255", "100.128.0.0", "172.32.0.1", "198.17.0.1", "198.20.0.1", "223.255.255.255", "11.0.0.1"] {
+            assert!(!v4(ip), "{ip}");
+        }
+        let v6 = |s: &str| is_private_ip(IpAddr::V6(s.parse().unwrap()));
+        for ip in [
+            "::", "::1", "ff02::1", "fc00::1", "fdff::1", "fe80::1", "febf::1", "fec0::1", "feff::1",
+            // IPv4 inside IPv6: mapped, compatible, translated, 6to4, NAT64
+            "::ffff:10.0.0.1", "::ffff:169.254.1.1", "::10.0.0.1", "::0.0.0.2", "::ffff:0:192.168.1.1", "2002:0a00:0001::", "64:ff9b::8.8.8.8",
+            "64:ff9b:1::1",
+        ] {
+            assert!(v6(ip), "{ip}");
+        }
+        for ip in ["2001:4860:4860::8888", "2606:4700::1111", "::ffff:8.8.8.8", "::8.8.8.8", "::ffff:0:8.8.8.8", "2002:0808:0808::1", "fe00::1", "2001:db8::1"] {
+            assert!(!v6(ip), "{ip}");
+        }
+    }
+
+    #[test]
+    fn private_host_names() {
+        for h in [
+            "", "[]", ".", "LOCALHOST", "a.localhost", "printer.local", "nas.lan", "svc.internal", "x.home.arpa", "wiki.intranet", "dc.corp", "pc.home",
+            "NAS.LOCAL.", "intranet", "[::]", "[fe80::1]",
+            // non-canonical IPv4 notations
+            "1.2.3", "1.2.3.4.5", "0x0a.0.0.1", "0x", "012.0.0.1", "4294967295",
+        ] {
+            assert!(is_private_host(h), "{h:?}");
+        }
+        for h in ["example.com", "EXAMPLE.COM.", "1.1.1.1", "[2001:4860:4860::8888]", "0x1.example", "local.example.com", "my-corp.com", "home.example"] {
+            assert!(!is_private_host(h), "{h}");
+        }
+        assert!(is_numeric_host("1.2"));
+        assert!(is_numeric_host("0xff.0x0"));
+        assert!(!is_numeric_host(""));
+        assert!(!is_numeric_host("1..2"));
+        assert!(!is_numeric_host("1.2.x"));
+        assert!(!is_numeric_host("0xfg"));
+    }
+
+    /// IP literals are checked without DNS; names are never resolved in this test.
+    #[test]
+    fn host_check_without_dns() {
+        assert!(check_host("8.8.8.8", 443).is_ok());
+        assert!(check_host("[2001:4860:4860::8888]", 443).is_ok());
+        for h in ["127.0.0.1", "localhost", "[::1]", "10.0.0.1", "router", "0x7f.1"] {
+            assert_eq!(check_host(h, 80).unwrap_err(), "local network addresses are not allowed", "{h}");
+        }
+    }
+
+    fn object(p: &Parsed) -> String {
+        assert_eq!(p.object.last(), Some(&0), "NUL-terminated");
+        String::from_utf16(&p.object[..p.object.len() - 1]).unwrap()
+    }
+
+    #[test]
+    fn url_cracking() {
+        let p = crack("http://example.com").unwrap();
+        assert_eq!((p.secure, p.host.as_str(), p.port, object(&p).as_str()), (false, "example.com", 80, "/"));
+        let p = crack("https://Example.com:8443/a/b.png?x=1&y=2").unwrap();
+        assert_eq!((p.secure, p.host.as_str(), p.port, object(&p).as_str()), (true, "Example.com", 8443, "/a/b.png?x=1&y=2"));
+        let p = crack("HTTPS://example.com/").unwrap();
+        assert_eq!((p.secure, p.port), (true, 443));
+        let p = crack("http://example.com:8080").unwrap();
+        assert_eq!((p.port, object(&p).as_str()), (8080, "/"));
+        let p = crack("http://[2001:db8::1]:81/x").unwrap();
+        assert_eq!(p.port, 81);
+        assert!(p.host.contains("2001:db8::1"), "{}", p.host);
+        assert!(is_private_host(&crack("http://[::1]/").unwrap().host), "a bracketed or bare IPv6 loopback is private");
+        for u in ["ftp://example.com/a.png", "file:///C:/a.png", "example.com/a.png", "javascript:alert(1)", ""] {
+            assert_eq!(crack(u).err().as_deref(), Some("only http and https are allowed"), "{u}");
+        }
+    }
+
+    #[test]
+    fn location_resolution_details() {
+        // absolute addresses (any case) are taken as is, surrounding spaces trimmed
+        assert_eq!(resolve_location("https://a.com/x", "  HTTPS://B.com/y  "), "HTTPS://B.com/y");
+        assert_eq!(resolve_location("http://a.com/x", "https://b.com"), "https://b.com");
+        // scheme-relative keeps the current scheme
+        assert_eq!(resolve_location("http://a.com/x", "//b.com/y"), "http://b.com/y");
+        // root-relative replaces the path, query and fragment
+        assert_eq!(resolve_location("https://a.com:8443/x/y?q=1#f", "/z"), "https://a.com:8443/z");
+        assert_eq!(resolve_location("https://a.com?q=1", "/z"), "https://a.com/z");
+        // path-relative: resolved against the current folder; the query of the base is dropped
+        assert_eq!(resolve_location("https://a.com/x/y.png?q=/1", "z.png"), "https://a.com/x/z.png");
+        assert_eq!(resolve_location("https://a.com", "z.png"), "https://a.com/z.png");
+        assert_eq!(resolve_location("https://a.com/", "z.png"), "https://a.com/z.png");
+        assert_eq!(resolve_location("https://a.com#frag", "z.png"), "https://a.com/z.png");
+        assert_eq!(resolve_location("https://a.com/dir/", "?p=2"), "https://a.com/dir/?p=2");
+    }
+
+    /// Addresses rejected before any connection is made (no network is touched).
+    #[test]
+    fn fetch_rejects_before_connecting() {
+        assert_eq!(fetch("ftp://example.com/a.png", 1024).unwrap_err(), "only http and https are allowed");
+        assert_eq!(fetch("file:///C:/a.png", 1024).unwrap_err(), "only http and https are allowed");
+        for u in ["http://127.0.0.1/", "https://localhost:8443/a.png", "http://[::1]/a.png", "http://10.1.2.3/", "http://192.168.0.1/", "http://router/", "http://2130706433/"] {
+            assert_eq!(fetch(u, 1024).unwrap_err(), "local network addresses are not allowed", "{u}");
+        }
+        assert!(fetch("http://", 1024).is_err());
+    }
+
+    /// A one-shot HTTP server on the loopback interface. Returns the port and a handle that
+    /// yields the raw request (empty if nobody connected within the timeout).
+    fn serve_once(response: Vec<u8>) -> (u16, std::thread::JoinHandle<String>) {
+        let (port, h) = serve(vec![response]);
+        (port, std::thread::spawn(move || h.join().unwrap().pop().unwrap_or_default()))
+    }
+
+    /// Like `serve_once`, for several connections in a row: one response per connection.
+    /// Yields the requests received (stops waiting after 10 s without a connection).
+    fn serve(responses: Vec<Vec<u8>>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        l.set_nonblocking(true).unwrap();
+        let h = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let t = std::time::Instant::now();
+                let mut s = loop {
+                    match l.accept() {
+                        Ok((s, _)) => break s,
+                        Err(_) if t.elapsed().as_secs() < 10 => std::thread::sleep(std::time::Duration::from_millis(5)),
+                        Err(_) => return requests,
+                    }
+                };
+                s.set_nonblocking(false).unwrap();
+                s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = s.write_all(&response);
+                let _ = s.flush();
+                requests.push(String::from_utf8_lossy(&req).into_owned());
+            }
+            requests
+        });
+        (port, h)
+    }
+
+    /// Host check for the loopback tests: only the test server is allowed.
+    fn loopback_only(host: &str, _port: u16) -> Result<(), String> {
+        if host == "127.0.0.1" {
+            Ok(())
+        } else {
+            Err(format!("blocked {host}"))
+        }
+    }
+
+    /// The whole request loop of `fetch` against the loopback server.
+    fn fetch_loopback(responses: Vec<Vec<u8>>, path: &str) -> (Result<Vec<u8>, String>, Vec<String>) {
+        let (port, server) = serve(responses);
+        let session = loopback_session();
+        let r = unsafe { fetch_with(&session, &format!("http://127.0.0.1:{port}{path}"), 1024, loopback_only) };
+        (r, server.join().unwrap())
+    }
+
+    #[test]
+    fn fragment_is_cut() {
+        assert_eq!(without_fragment("https://x/a.png#f"), "https://x/a.png");
+        assert_eq!(without_fragment("https://x/a.png?q=1#f#g"), "https://x/a.png?q=1");
+        assert_eq!(without_fragment("https://x/a.png#"), "https://x/a.png");
+        assert_eq!(without_fragment("https://x/a.png"), "https://x/a.png");
+        // the host ends at "#", as in links::classify — "@" after it is not userinfo
+        let p = crack(without_fragment("http://a.example#@127.0.0.1/x")).unwrap();
+        assert_eq!((p.host.as_str(), object(&p).as_str()), ("a.example", "/"));
+    }
+
+    /// Regression: `https://x/a.png#f` requested `/a.png%23f`. Neither the first address nor
+    /// a redirect address sends its fragment.
+    #[test]
+    fn fragment_is_never_sent() {
+        let (r, reqs) = fetch_loopback(
+            vec![response("HTTP/1.1 302 Found\r\nLocation: /b.png?q=1#loc-frag", b""), response("HTTP/1.1 200 OK", b"img")],
+            "/a.png?x=1#frag",
+        );
+        assert_eq!(r.as_deref(), Ok(&b"img"[..]));
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[0].starts_with("GET /a.png?x=1 HTTP/1.1\r\n"), "{}", reqs[0]);
+        assert!(reqs[1].starts_with("GET /b.png?q=1 HTTP/1.1\r\n"), "{}", reqs[1]);
+        for req in &reqs {
+            assert!(!req.contains("frag") && !req.contains("%23"), "{req}");
+        }
+    }
+
+    /// Every redirect is resolved, re-checked and counted.
+    #[test]
+    fn redirects_are_checked_at_every_step() {
+        // a relative address is resolved against the current one
+        let (r, reqs) = fetch_loopback(vec![response("HTTP/1.1 301 Moved\r\nLocation: next.png", b""), response("HTTP/1.1 200 OK", b"ok")], "/dir/a.png");
+        assert_eq!(r.as_deref(), Ok(&b"ok"[..]));
+        assert!(reqs[1].starts_with("GET /dir/next.png HTTP/1.1\r\n"), "{}", reqs[1]);
+        // a redirect to another host goes through the host check again, before connecting
+        let (r, reqs) = fetch_loopback(vec![response("HTTP/1.1 302 Found\r\nLocation: http://10.0.0.1/x.png", b"")], "/");
+        assert_eq!(r.unwrap_err(), "blocked 10.0.0.1");
+        assert_eq!(reqs.len(), 1);
+        // a scheme-relative redirect to another host, with a fragment
+        let (r, reqs) = fetch_loopback(vec![response("HTTP/1.1 303 See Other\r\nLocation: //10.0.0.2/x.png#f", b"")], "/");
+        assert_eq!(r.unwrap_err(), "blocked 10.0.0.2");
+        assert_eq!(reqs.len(), 1);
+        // at most MAX_REDIRECTS redirects
+        let hops = (0..=MAX_REDIRECTS).map(|_| response("HTTP/1.1 307 Again\r\nLocation: /again", b"")).collect();
+        let (r, reqs) = fetch_loopback(hops, "/");
+        assert_eq!(r.unwrap_err(), "too many redirects");
+        assert_eq!(reqs.len(), MAX_REDIRECTS + 1);
+        // the first address is checked too: nothing is requested
+        let session = loopback_session();
+        let r = unsafe { fetch_with(&session, "http://localhost:1/a.png#f", 1024, loopback_only) };
+        assert_eq!(r.unwrap_err(), "blocked localhost");
+    }
+
+    /// A WinHTTP session without any proxy (no WPAD lookups): only the loopback server is contacted.
+    fn loopback_session() -> H {
+        let ua = wide("vibe-md-viewer-test");
+        let s = H(unsafe { WinHttpOpen(PCWSTR::from_raw(ua.as_ptr()), WINHTTP_ACCESS_TYPE_NO_PROXY, PCWSTR::null(), PCWSTR::null(), 0) });
+        assert!(!s.0.is_null());
+        unsafe {
+            let _ = WinHttpSetTimeouts(s.0, 5000, 5000, 5000, 5000);
+        }
+        s
+    }
+
+    fn response(head: &str, body: &[u8]) -> Vec<u8> {
+        let mut r = format!("{head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+        r.extend_from_slice(body);
+        r
+    }
+
+    /// Runs one request of `fetch` (`fetch_once`) against the loopback server.
+    fn once(resp: Vec<u8>, path: &str, max: usize, deadline_s: u64) -> (Result<Step, String>, String) {
+        let (port, server) = serve_once(resp);
+        let session = loopback_session();
+        let p = crack(&format!("http://127.0.0.1:{port}{path}")).unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("127.0.0.1", port));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(deadline_s);
+        let r = unsafe { fetch_once(&session, &p, max, deadline) };
+        (r, server.join().unwrap())
+    }
+
+    /// The request/response handling of one step, on a local loopback server (no internet,
+    /// no proxy). The address checks are bypassed on purpose: `fetch` itself refuses 127.0.0.1.
+    #[test]
+    fn single_request_handling() {
+        // 200: the body is returned; the request carries no cookies, credentials or Referer
+        let (r, req) = once(response("HTTP/1.1 200 OK", b"\x89PNG-body"), "/img.png?x=1", 1024, 30);
+        match r {
+            Ok(Step::Body(b)) => assert_eq!(b, b"\x89PNG-body"),
+            Ok(Step::Redirect(l)) => panic!("redirect {l}"),
+            Err(e) => panic!("{e}"),
+        }
+        assert!(req.starts_with("GET /img.png?x=1 HTTP/1.1\r\n"), "{req}");
+        let lower = req.to_ascii_lowercase();
+        assert!(lower.contains("\r\naccept: image/*\r\n"), "{req}");
+        assert!(lower.contains("\r\nuser-agent: vibe-md-viewer-test\r\n"), "{req}");
+        for h in ["cookie:", "referer:", "authorization:"] {
+            assert!(!lower.contains(h), "{h} in {req}");
+        }
+        // every redirect status hands the Location back to `fetch` (which re-checks it)
+        for code in [301, 302, 303, 307, 308] {
+            let (r, _) = once(response(&format!("HTTP/1.1 {code} Moved\r\nLocation: /next.png"), b""), "/a.png", 1024, 30);
+            match r {
+                Ok(Step::Redirect(l)) => assert_eq!(l, "/next.png", "{code}"),
+                Ok(Step::Body(_)) => panic!("{code}: body"),
+                Err(e) => panic!("{code}: {e}"),
+            }
+        }
+        let err = |r: Result<Step, String>| match r {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error"),
+        };
+        // a redirect without an address
+        assert_eq!(err(once(response("HTTP/1.1 302 Found", b""), "/", 1024, 30).0), "redirect without an address");
+        // a redirect address with a hidden control character
+        assert_eq!(err(once(response("HTTP/1.1 302 Found\r\nLocation: /a\tb.png", b""), "/", 1024, 30).0), "suspicious redirect address");
+        // any other status
+        assert_eq!(err(once(response("HTTP/1.1 404 Not Found", b"nope"), "/", 1024, 30).0), "server responded 404");
+        assert_eq!(err(once(response("HTTP/1.1 304 Not Modified", b""), "/", 1024, 30).0), "server responded 304");
+        // the server closes the connection without answering
+        assert!(err(once(Vec::new(), "/", 1024, 30).0).starts_with("network error"));
+        // the size limit and the overall deadline
+        assert_eq!(err(once(response("HTTP/1.1 200 OK", &[7u8; 100]), "/", 10, 30).0), "image is too large");
+        assert_eq!(err(once(response("HTTP/1.1 200 OK", b"data"), "/", 1024, 0).0), "the server responds too slowly");
     }
 
     /// Real download from the internet: `cargo test fetch_public -- --ignored`

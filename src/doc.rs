@@ -291,4 +291,236 @@ mod tests {
         assert_eq!(f.text, "hi");
         assert_eq!(f.encoding, Encoding::Utf16Le);
     }
+
+    /// A fresh folder under .toolcache\tmp (unique per process: several test runs may overlap).
+    fn tmp_dir(name: &str) -> PathBuf {
+        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".toolcache").join("tmp").join(format!("doc-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The system ANSI code page is UTF-8 ("Beta: Unicode UTF-8" in Windows settings):
+    /// then WideCharToMultiByte rejects our flags and ANSI saving falls back to UTF-8.
+    fn acp_is_utf8() -> bool {
+        unsafe { windows::Win32::Globalization::GetACP() == 65001 }
+    }
+
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn labels() {
+        let enc = [Encoding::Utf8, Encoding::Utf8Bom, Encoding::Utf16Le, Encoding::Utf16Be, Encoding::Ansi].map(Encoding::label);
+        assert_eq!(enc, ["UTF-8", "UTF-8 BOM", "UTF-16 LE", "UTF-16 BE", "ANSI"]);
+        assert_eq!([Eol::Crlf, Eol::Lf, Eol::Cr].map(Eol::label), ["CRLF", "LF", "CR"]);
+        assert_eq!([Eol::Crlf, Eol::Lf, Eol::Cr].map(Eol::as_str), ["\r\n", "\n", "\r"]);
+    }
+
+    #[test]
+    fn decodes_utf16_be_and_odd_bytes() {
+        let f = decode(&[0xFE, 0xFF, 0, b'h', 0, b'i', 0, b'\r', 0, b'\n']);
+        assert_eq!((f.text.as_str(), f.encoding, f.eol, f.lossy), ("hi\n", Encoding::Utf16Be, Eol::Crlf, false));
+        // A trailing odd byte is dropped and marks the file as lossy (saving would change it).
+        let f = decode(&[0xFE, 0xFF, 0, b'h', 0, b'i', 0x41]);
+        assert_eq!((f.text.as_str(), f.encoding, f.lossy), ("hi", Encoding::Utf16Be, true));
+        let f = decode(&[0xFF, 0xFE, b'h', 0, b'i', 0, 0x41]);
+        assert_eq!((f.text.as_str(), f.encoding, f.lossy), ("hi", Encoding::Utf16Le, true));
+        // Only the BOM → empty text, not lossy.
+        let f = decode(&[0xFF, 0xFE]);
+        assert_eq!((f.text.as_str(), f.encoding, f.lossy), ("", Encoding::Utf16Le, false));
+    }
+
+    #[test]
+    fn decodes_utf16_surrogates() {
+        // "😀" = D83D DE00: a valid pair is kept.
+        let f = decode(&[0xFF, 0xFE, 0x3D, 0xD8, 0x00, 0xDE]);
+        assert_eq!((f.text.as_str(), f.lossy), ("😀", false));
+        let f = decode(&[0xFE, 0xFF, 0xD8, 0x3D, 0xDE, 0x00]);
+        assert_eq!((f.text.as_str(), f.lossy), ("😀", false));
+        // An unpaired surrogate → U+FFFD and lossy.
+        let f = decode(&[0xFF, 0xFE, 0x00, 0xD8, b'a', 0]);
+        assert_eq!((f.text.as_str(), f.encoding, f.lossy), ("\u{FFFD}a", Encoding::Utf16Le, true));
+        let f = decode(&[0xFE, 0xFF, 0xDC, 0x00]);
+        assert_eq!((f.text.as_str(), f.encoding, f.lossy), ("\u{FFFD}", Encoding::Utf16Be, true));
+    }
+
+    #[test]
+    fn decodes_utf8_variants() {
+        let f = decode(b"");
+        assert_eq!((f.text.as_str(), f.encoding, f.eol, f.lossy), ("", Encoding::Utf8, Eol::Crlf, false));
+        let f = decode("# Заголовок\nтекст".as_bytes());
+        assert_eq!((f.text.as_str(), f.encoding, f.eol, f.lossy), ("# Заголовок\nтекст", Encoding::Utf8, Eol::Lf, false));
+        // Invalid bytes after a BOM: still UTF-8 BOM, replaced and lossy.
+        let f = decode(b"\xEF\xBB\xBFa\xFFb");
+        assert_eq!((f.text.as_str(), f.encoding, f.lossy), ("a\u{FFFD}b", Encoding::Utf8Bom, true));
+        let f = decode(b"\xEF\xBB\xBF");
+        assert_eq!((f.text.as_str(), f.encoding, f.lossy), ("", Encoding::Utf8Bom, false));
+        // NUL breaks text controls: replaced, lossy.
+        let f = decode(b"a\0b\0");
+        assert_eq!((f.text.as_str(), f.encoding, f.lossy), ("a\u{FFFD}b\u{FFFD}", Encoding::Utf8, true));
+        let f = decode(&[0xFF, 0xFE, b'x', 0, 0, 0]);
+        assert_eq!((f.text.as_str(), f.lossy), ("x\u{FFFD}", true));
+    }
+
+    #[test]
+    fn decodes_ansi() {
+        // Not valid UTF-8 → the system code page (é in 1252, й in 1251, U+FFFD with a UTF-8 code page).
+        let f = decode(b"caf\r\nx\xE9");
+        assert_eq!(f.encoding, Encoding::Ansi);
+        assert_eq!(f.eol, Eol::Crlf);
+        assert!(f.text.starts_with("caf\nx") && f.text.len() > 5, "{:?}", f.text);
+        assert!(!f.lossy);
+        assert_eq!(ansi_to_string(b""), "");
+        assert_eq!(ansi_to_string(b"plain ASCII"), "plain ASCII");
+    }
+
+    #[test]
+    fn detects_eol() {
+        let cases = [
+            ("abc", Eol::Crlf, "abc"),
+            ("a\rb", Eol::Cr, "a\nb"),
+            ("a\r", Eol::Cr, "a\n"),
+            ("a\nb\r\nc", Eol::Lf, "a\nb\nc"),
+            ("a\r\nb\nc\rd", Eol::Crlf, "a\nb\nc\nd"),
+            ("\r\r\n", Eol::Cr, "\n\n"),
+        ];
+        for (src, eol, text) in cases {
+            assert_eq!(detect_eol(src), eol, "{src:?}");
+            assert_eq!(normalize_eol(src), text, "{src:?}");
+            let f = decode(src.as_bytes());
+            assert_eq!((f.eol, f.text.as_str()), (eol, text), "{src:?}");
+        }
+        assert_eq!(normalize_eol("no breaks"), "no breaks");
+    }
+
+    #[test]
+    fn ansi_encoding() {
+        assert_eq!(string_to_ansi(""), Some(Vec::new()));
+        // No single-byte code page has an emoji.
+        assert_eq!(string_to_ansi("x😀"), None);
+        if acp_is_utf8() {
+            assert_eq!(string_to_ansi("abc"), None);
+        } else {
+            assert_eq!(string_to_ansi("abc\r\n").as_deref(), Some(&b"abc\r\n"[..]));
+        }
+    }
+
+    #[test]
+    fn save_round_trips_every_encoding_and_eol() {
+        let dir = tmp_dir("roundtrip");
+        let text = "# Заголовок\n\ncafé ✓ 😀\nlast";
+        for enc in [Encoding::Utf8, Encoding::Utf8Bom, Encoding::Utf16Le, Encoding::Utf16Be] {
+            for eol in [Eol::Crlf, Eol::Lf, Eol::Cr] {
+                let path = dir.join(format!("{}-{}.md", enc.label(), eol.label()));
+                assert_eq!(save(&path, text, enc, eol).unwrap(), enc);
+                let bytes = fs::read(&path).unwrap();
+                let bom: &[u8] = match enc {
+                    Encoding::Utf8 => &[],
+                    Encoding::Utf8Bom => &[0xEF, 0xBB, 0xBF],
+                    Encoding::Utf16Le => &[0xFF, 0xFE],
+                    Encoding::Utf16Be => &[0xFE, 0xFF],
+                    Encoding::Ansi => unreachable!(),
+                };
+                assert!(bytes.starts_with(bom), "{enc:?}");
+                let f = load(&path).unwrap();
+                assert_eq!((f.text.as_str(), f.encoding, f.eol, f.lossy), (text, enc, eol, false), "{enc:?} {eol:?}");
+            }
+        }
+        // Exact bytes.
+        let p = dir.join("exact.md");
+        save(&p, "a\nb", Encoding::Utf16Be, Eol::Crlf).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), [0xFE, 0xFF, 0, b'a', 0, b'\r', 0, b'\n', 0, b'b']);
+        save(&p, "a\nb", Encoding::Utf16Le, Eol::Cr).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), [0xFF, 0xFE, b'a', 0, b'\r', 0, b'b', 0]);
+        save(&p, "a\nb\n", Encoding::Utf8Bom, Eol::Lf).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"\xEF\xBB\xBFa\nb\n");
+        save(&p, "", Encoding::Utf8, Eol::Crlf).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"");
+        assert_eq!(file_names(&dir).iter().filter(|n| n.ends_with(".vmd-tmp")).count(), 0, "no temporary files left");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_ansi_and_fallback_to_utf8() {
+        let dir = tmp_dir("ansi");
+        let p = dir.join("ansi.md");
+        let used = save(&p, "abc\nd", Encoding::Ansi, Eol::Crlf).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"abc\r\nd");
+        assert_eq!(used, if acp_is_utf8() { Encoding::Utf8 } else { Encoding::Ansi });
+        // A character missing from the code page → saved as UTF-8 instead of losing it.
+        assert_eq!(save(&p, "smile 😀\n", Encoding::Ansi, Eol::Lf).unwrap(), Encoding::Utf8);
+        assert_eq!(fs::read(&p).unwrap(), "smile 😀\n".as_bytes());
+        assert_eq!(save(&p, "", Encoding::Ansi, Eol::Lf).unwrap(), Encoding::Ansi, "empty text needs no conversion");
+        assert_eq!(fs::read(&p).unwrap(), b"");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_errors() {
+        let dir = tmp_dir("load");
+        let e = load(&dir.join("missing.md")).unwrap_err();
+        assert!(e.starts_with("Could not open the file"), "{e}");
+        assert_eq!(load(&dir).unwrap_err(), "This is not a file");
+        // Over the limit: a file of MAX_FILE_BYTES + 1 (set_len only extends the size, nothing is written).
+        let big = dir.join("big.md");
+        let f = fs::File::create(&big).unwrap();
+        f.set_len(MAX_FILE_BYTES + 1).unwrap();
+        drop(f);
+        let e = load(&big).unwrap_err();
+        assert!(e.contains("too large (64 MB)") && e.contains("limit is 64 MB"), "{e}");
+        // A normal file loads.
+        let small = dir.join("ok.md");
+        fs::write(&small, b"x\r\ny").unwrap();
+        let f = load(&small).unwrap();
+        assert_eq!((f.text.as_str(), f.eol), ("x\ny", Eol::Crlf));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_creates_and_replaces() {
+        let dir = tmp_dir("atomic");
+        let p = dir.join("note.md");
+        atomic_write(&p, b"first").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"first");
+        atomic_write(&p, b"second, longer").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"second, longer");
+        atomic_write(&p, b"").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"");
+        assert_eq!(file_names(&dir), ["note.md"], "only the target remains");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_errors_leave_no_temporary_files() {
+        let dir = tmp_dir("atomic-err");
+        // The target is a folder: neither ReplaceFileW nor MoveFileExW can replace it.
+        let target = dir.join("folder.md");
+        fs::create_dir_all(&target).unwrap();
+        let e = atomic_write(&target, b"x").unwrap_err();
+        assert!(e.starts_with("Could not save"), "{e}");
+        assert_eq!(file_names(&dir), ["folder.md"], "the temporary file is removed");
+        assert!(target.is_dir());
+        // The parent folder does not exist → the temporary file cannot be created.
+        let e = atomic_write(&dir.join("no-such-dir").join("a.md"), b"x").unwrap_err();
+        assert!(e.starts_with("Could not write the file"), "{e}");
+        // No parent folder or file name.
+        assert_eq!(atomic_write(Path::new(""), b"x").unwrap_err(), "Invalid path");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mtime_of_files() {
+        let dir = tmp_dir("mtime");
+        let p = dir.join("a.md");
+        assert!(mtime(&p).is_none());
+        fs::write(&p, b"x").unwrap();
+        let t = mtime(&p).expect("modification time");
+        assert!(t <= std::time::SystemTime::now() + std::time::Duration::from_secs(5));
+        assert_eq!(mtime(&p), Some(t), "stable while the file is unchanged");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

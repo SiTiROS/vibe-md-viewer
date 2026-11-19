@@ -465,6 +465,11 @@ unsafe fn bar_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
 }
 
 /// Hint for an item by id (for the status bar).
+/// Where the button `id` is on the bar (as of the last paint) — for the self-test's real clicks.
+pub fn item_rect(hwnd: HWND, id: u16) -> Option<RECT> {
+    with_bar(hwnd, |b| b.items.iter().zip(b.rects.iter()).find(|(it, r)| it.id == id && r.right > r.left).map(|(_, r)| *r)).flatten()
+}
+
 pub fn hint_for(hwnd: HWND, id: u16) -> Option<String> {
     with_bar(hwnd, |b| b.items.iter().find(|i| i.id == id).map(|i| i.hint.clone())).flatten()
 }

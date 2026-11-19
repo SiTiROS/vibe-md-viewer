@@ -2,7 +2,33 @@
 
 **English** | [Русский](CHANGELOG.ru.md)
 
-## 0.2.0 — 2026-11-18
+## 0.2.0 — 2026-11-19
+
+### Look
+- **Color emoji** in the view — ✅ ❌ 🟡 ⚠️ 🚀, sequences like 👨‍👩‍👧, keycaps 1️⃣. RichEdit draws through GDI, which has no color fonts, so the view paints the color version on top with DirectWrite/Direct2D (Segoe UI Emoji); each emoji is rendered once and cached. `d2d1.dll`/`dwrite.dll` are loaded only for a document with emoji and only after the first paint — opening speed is unchanged. In Visual and Code modes emoji use the emoji font, in monochrome.
+- Emoji and symbols (✔ ★ ☐ ⌘) no longer show as empty boxes □: they get Segoe UI Emoji / Segoe UI Symbol explicitly (RichEdit's own font fallback found no glyph for many of them).
+- **Dark theme in the colors of Claude's Markdown preview:** a soft slate-gray page instead of near-black, slightly dimmed body text, bright headings, calm blue links, gray table header and code backgrounds.
+
+### Fixes
+- “Make default app for .md” opened dozens of “Open with” windows. Now it opens Windows Settings → Default apps (Windows 11 — the vibe-md-viewer page, Windows 10 — “Choose default apps by file type”).
+- The “Images from the internet” bar asked again after every re-render, and failures were only in the status bar. The answer is now remembered for the document, and a failed download is shown in the bar with the reason.
+- Visual mode: after widening the window or switching the column width the old layout stayed next to the new one (the text looked duplicated). The editor is now repainted completely.
+- Ctrl+Shift+X cut the selection instead of striking it through.
+- The `#fragment` of an image address was sent to the server (`/a.png%23f` → 404).
+- HTML in Markdown:
+  - multi-line `<!-- … -->` comments and tags split across lines now work;
+  - an unclosed `<iframe>`, `<svg>`, `<video>`… no longer hides the rest of the document, only up to the end of its block;
+  - `<form>` content is hidden, as documented;
+  - `<li>`, `<hr>` and `$$…$$` inside a table cell stay in the cell;
+  - an unclosed `<a href>` in a cell ends with the cell;
+  - the alignment of an unclosed `<p align>` ends with its block, and `</p>` no longer ends a `<div>`'s alignment;
+  - `<code>`/`<kbd>` pills always get both paddings;
+  - `<3` stays text;
+  - loose task lists show no bullet.
+- Email autolinks `<me@example.com>` open the mail client.
+- Rust highlighting: `a != b` is no longer colored as a macro.
+- `lang = ru` with spaces in `settings.ini` is recognized at startup.
+- A table being built counts toward the 96 MB document limit, and the RTF stays valid when the limit is hit inside a table.
 
 ### English language
 - **English (default) and Russian interface** — the **EN / RU** toolbar button switches the language immediately and remembers it (`lang=` in `settings.ini`). The installer speaks the language of the installed program.
@@ -28,7 +54,10 @@
 
 ### Checks
 - Migration tests: recognizing a 0.1.x installation, the new folder, deleting only “our” folder, cleaning up old registry entries.
-- A test for every audit finding; self-test: autosave when another program changed the file, language switching (43 checks in total).
+- A test for every audit finding; self-test: autosave when another program changed the file, language switching.
+- **258 unit tests** covering every module. They include a WinHTTP request against a local 127.0.0.1 server (never the internet), color emoji rendering, and every `classify` branch for links and paths.
+- Self-test, 56 checks: added the “?” button (a real click), Visual-mode repaint after a width change, the images bar, keyboard shortcuts and toolbar commands, and color emoji (also after scrolling).
+- **Code coverage 87.7% of lines** (was 67.6%). `scripts\coverage.ps1` measures unit tests + self-test on an instrumented build. CI publishes the report and fails below 85%. Not covered: system dialogs, UAC and installing into Program Files.
 - Tests on a real RichEdit run one at a time (in parallel the pixel check occasionally saw an empty frame).
 
 ## 0.1.3 — 2026-11-18

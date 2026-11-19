@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use pulldown_cmark::{Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
 
 use crate::highlight::Kind;
 use crate::html::{self, Tok};
@@ -190,6 +190,34 @@ struct TableState {
     cur: String,
     cur_len: usize,
     in_head: bool,
+    /// RTF of the finished cells (counts toward MAX_RTF_BYTES while the table is assembled).
+    bytes: usize,
+    base: TableBase,
+}
+
+/// Renderer state at the start of a table. If the document is cut off (MAX_RTF_BYTES) inside
+/// the table, its buffered RTF is dropped — and with it the groups, links, images and anchors
+/// whose braces and markers are in that buffer; they are rolled back to this state.
+#[derive(Clone, Copy)]
+struct TableBase {
+    inline: usize,
+    emitted: usize,
+    html_groups: usize,
+    link_text: usize,
+    html_links: u32,
+    links: usize,
+    images: usize,
+    anchors: usize,
+    data_budget: usize,
+}
+
+/// Alignment set by an HTML tag (`align=`, `<center>`).
+struct AlignEntry {
+    align: Align,
+    tag: String,
+    /// `<p>`, `<h1>`…: ends with its block even without the closing tag (in a browser the next
+    /// paragraph closes `<p>` too); containers (`<div>`, `<center>`…) last until closed.
+    block: bool,
 }
 
 struct ImageCapture {
@@ -230,10 +258,16 @@ struct R<'a> {
     anchors: Vec<String>,
     images: Vec<ImageReq>,
     slugs: HashMap<String, u32>,
-    align: Vec<Align>,
+    align: Vec<AlignEntry>,
     html_skip: Option<(String, u32)>,
-    html_groups: Vec<String>,
+    /// An HTML block being collected: pulldown-cmark delivers it line by line, but comments
+    /// and tags may span lines, so it is tokenized as a whole at the block's end.
+    html_block: Option<String>,
+    /// Open HTML groups: tag name and whether the group needs a closing INLINE_PAD (`<code>`…).
+    html_groups: Vec<(String, bool)>,
     html_links: u32,
+    /// Where the list bullet of the open paragraph is in `out` (a task-list checkbox replaces it).
+    bullet_at: Option<(usize, usize)>,
     footnote: bool,
     def_depth: u32,
     tight_stack: Vec<bool>,
@@ -251,6 +285,11 @@ struct R<'a> {
 }
 
 pub fn render(md: &str, opts: &RenderOpts) -> Rendered {
+    render_limited(md, opts, MAX_RTF_BYTES)
+}
+
+/// `render` with the RTF size limit as a parameter (tests cut documents off with small limits).
+fn render_limited(md: &str, opts: &RenderOpts, max_rtf: usize) -> Rendered {
     let mut r = R {
         out: String::with_capacity(md.len() * 2 + 1024),
         opts,
@@ -271,8 +310,10 @@ pub fn render(md: &str, opts: &RenderOpts) -> Rendered {
         slugs: HashMap::new(),
         align: Vec::new(),
         html_skip: None,
+        html_block: None,
         html_groups: Vec::new(),
         html_links: 0,
+        bullet_at: None,
         footnote: false,
         def_depth: 0,
         tight_stack: Vec::new(),
@@ -297,24 +338,33 @@ pub fn render(md: &str, opts: &RenderOpts) -> Rendered {
     for (ev, range) in parser {
         r.src_pos = range.start;
         r.event(ev);
-        if r.out.len() > MAX_RTF_BYTES {
+        // A table being assembled counts too: its cells are buffered until the table ends.
+        let pending = r.table.as_ref().map_or(0, |t| t.bytes + t.cur.len());
+        if r.out.len() + pending > max_rtf {
             truncated = true;
             break;
         }
     }
     if truncated {
-        // An unfinished table/code block is simply dropped; everything else is closed normally.
-        r.table = None;
+        // An unfinished table/code block/HTML block is simply dropped; everything else is closed normally.
+        if let Some(t) = r.table.take() {
+            r.drop_table_state(t.base);
+        }
         r.code = None;
         r.image = None;
+        r.html_block = None;
     }
     r.close_para();
-    while r.html_groups.pop().is_some() {
-        r.close_group();
+    // Links still open at the end (an unclosed <a href>, a cut-off document) get their end marker.
+    r.html_links = 0;
+    while !r.link_text.is_empty() {
+        r.link_end();
     }
+    while r.pop_html_group() {}
     while !r.inline_stack.is_empty() {
         r.close_group();
     }
+    r.align.clear();
     if truncated {
         let _ = write!(r.out, "\\pard\\plain\\sb240\\f0\\fs22\\cf{C_WARN} ");
         esc_into(
@@ -369,6 +419,145 @@ pub fn esc_into(out: &mut String, s: &str, newline: &str) {
     }
 }
 
+/// Escapes text like [`esc_into`], but puts emoji into the emoji font (`\f3`, Segoe UI Emoji) and
+/// other pictographic symbols into Segoe UI Symbol (`\f2`): RichEdit's own font fallback often
+/// finds no glyph for them (□ instead of 🟡 or ✔). RichEdit draws through GDI, which has no color
+/// fonts, so the emoji come out monochrome; the view paints their color version on top
+/// (`emoji_clusters`, emoji.rs). Only adds font groups: without them the output is `esc_into`.
+pub fn text_into(out: &mut String, s: &str, newline: &str) {
+    if s.is_ascii() {
+        esc_into(out, s, newline);
+        return;
+    }
+    let mut rest = s;
+    while let Some((a, b, emoji)) = next_symbol_run(rest) {
+        esc_into(out, &rest[..a], newline);
+        out.push_str(if emoji { "{\\f3 " } else { "{\\f2 " });
+        esc_into(out, &rest[a..b], newline);
+        out.push('}');
+        rest = &rest[b..];
+    }
+    esc_into(out, rest, newline);
+}
+
+/// The first run of emoji or of symbols in `s`: byte range and whether it is emoji.
+/// Adjacent clusters of the same kind make one run (one font group).
+fn next_symbol_run(s: &str) -> Option<(usize, usize, bool)> {
+    let mut i = 0;
+    while i < s.len() {
+        if let Some((mut end, emoji)) = symbol_at(s, i) {
+            while let Some((e, k)) = symbol_at(s, end) {
+                if k != emoji {
+                    break;
+                }
+                end = e;
+            }
+            return Some((i, end, emoji));
+        }
+        i += s[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    None
+}
+
+/// If an emoji cluster or a pictographic symbol starts at byte `i` of `s`: its end and whether it
+/// is an emoji. An emoji is an emoji-presentation character, any character followed by U+FE0F, or
+/// a keycap (`1️⃣`), together with its modifiers (skin tones, U+FE0F, tags), ZWJ-joined parts
+/// (`👨‍👩‍👧`) and the second regional indicator of a flag. U+FE0E keeps a character as text.
+fn symbol_at(s: &str, i: usize) -> Option<(usize, bool)> {
+    let mut it = s[i..].chars();
+    let c = it.next()?;
+    let (n1, n2) = (it.next(), it.next());
+    let emoji = if c.is_ascii() {
+        matches!(c, '0'..='9' | '#' | '*') && n1 == Some('\u{FE0F}') && n2 == Some('\u{20E3}')
+    } else {
+        n1 != Some('\u{FE0E}') && (emoji_presentation(c) || n1 == Some('\u{FE0F}'))
+    };
+    if !emoji {
+        if c.is_ascii() || !pictographic_symbol(c) {
+            return None;
+        }
+        let vs = if n1 == Some('\u{FE0E}') { '\u{FE0E}'.len_utf8() } else { 0 };
+        return Some((i + c.len_utf8() + vs, false));
+    }
+    let regional = |c: char| ('\u{1F1E6}'..='\u{1F1FF}').contains(&c);
+    let mut flag = regional(c);
+    let mut end = i + c.len_utf8();
+    let mut after_zwj = false;
+    for d in s[end..].chars() {
+        let take = if after_zwj {
+            !d.is_ascii() && !d.is_whitespace()
+        } else if flag && regional(d) {
+            flag = false;
+            true
+        } else {
+            emoji_joiner(d)
+        };
+        if !take {
+            break;
+        }
+        after_zwj = d == '\u{200D}';
+        end += d.len_utf8();
+    }
+    Some((end, true))
+}
+
+/// Emoji clusters in RichEdit text (UTF-16 positions, [start, end)) — for the view's color
+/// overlay. The same rules as [`text_into`].
+pub fn emoji_clusters(text: &[u16]) -> Vec<(i32, i32)> {
+    symbol_clusters(text).into_iter().filter(|c| c.2).map(|(s, e, _)| (s, e)).collect()
+}
+
+/// Emoji clusters and pictographic symbols in RichEdit text: UTF-16 [start, end) and whether
+/// it is an emoji — for the source editor's fonts (editor.rs). The same rules as [`text_into`].
+pub fn symbol_clusters(text: &[u16]) -> Vec<(i32, i32, bool)> {
+    let mut out = Vec::new();
+    // Every emoji and symbol contains a code unit of U+2300 or above (a keycap has U+FE0F).
+    if !text.iter().any(|&u| u >= 0x2300) {
+        return out;
+    }
+    // Unpaired surrogates become U+FFFD: one unit either way, positions stay the same.
+    let s = String::from_utf16_lossy(text);
+    let u16len = |t: &str| t.chars().map(char::len_utf16).sum::<usize>() as i32;
+    let (mut i, mut last, mut pos) = (0usize, 0usize, 0i32);
+    while i < s.len() {
+        match symbol_at(&s, i) {
+            Some((end, emoji)) => {
+                pos += u16len(&s[last..i]);
+                let n = u16len(&s[i..end]);
+                out.push((pos, pos + n, emoji));
+                pos += n;
+                (i, last) = (end, end);
+            }
+            None => i += s[i..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    out
+}
+
+/// Characters that only continue an emoji: variation selector, keycap, ZWJ, skin tones, tags.
+fn emoji_joiner(c: char) -> bool {
+    matches!(c, '\u{FE0F}' | '\u{20E3}' | '\u{200D}' | '\u{1F3FB}'..='\u{1F3FF}' | '\u{E0020}'..='\u{E007F}')
+}
+
+/// Symbol blocks that Segoe UI lacks and Segoe UI Symbol has: technical symbols, enclosed
+/// alphanumerics, geometric shapes, miscellaneous symbols, dingbats, arrows, pictographs.
+fn pictographic_symbol(c: char) -> bool {
+    matches!(c as u32, 0x2300..=0x23FF | 0x2460..=0x24FF | 0x25A0..=0x27BF | 0x2900..=0x297F | 0x2B00..=0x2BFF | 0x1F000..=0x1FAFF)
+}
+
+/// Characters shown as emoji by default (Unicode `Emoji_Presentation`, the pictograph blocks whole).
+fn emoji_presentation(c: char) -> bool {
+    matches!(c as u32,
+        0x231A..=0x231B | 0x23E9..=0x23EC | 0x23F0 | 0x23F3 | 0x25FD..=0x25FE | 0x2614..=0x2615
+        | 0x2648..=0x2653 | 0x267F | 0x2693 | 0x26A1 | 0x26AA..=0x26AB | 0x26BD..=0x26BE | 0x26C4..=0x26C5
+        | 0x26CE | 0x26D4 | 0x26EA | 0x26F2..=0x26F3 | 0x26F5 | 0x26FA | 0x26FD | 0x2705 | 0x270A..=0x270B
+        | 0x2728 | 0x274C | 0x274E | 0x2753..=0x2755 | 0x2757 | 0x2795..=0x2797 | 0x27B0 | 0x27BF
+        | 0x2B1B..=0x2B1C | 0x2B50 | 0x2B55
+        | 0x1F004 | 0x1F0CF | 0x1F18E | 0x1F191..=0x1F19A | 0x1F1E6..=0x1F1FF | 0x1F201 | 0x1F21A | 0x1F22F
+        | 0x1F232..=0x1F236 | 0x1F238..=0x1F23A | 0x1F250..=0x1F251 | 0x1F300..=0x1F64F | 0x1F680..=0x1F6FF
+        | 0x1F7E0..=0x1F7EB | 0x1F7F0 | 0x1F90C..=0x1F9FF | 0x1FA70..=0x1FAFF)
+}
+
 fn color(out: &mut String, c: u32) {
     let _ = write!(out, "\\red{}\\green{}\\blue{};", theme::r(c), theme::g(c), theme::b(c));
 }
@@ -383,6 +572,30 @@ pub fn slugify(s: &str) -> String {
         }
     }
     out
+}
+
+/// The end of a block-level element: there unclosed hiding (<iframe>, <form>…) and the
+/// alignment of an unclosed <p> end.
+fn is_block_end(t: &TagEnd) -> bool {
+    matches!(
+        t,
+        TagEnd::Paragraph
+            | TagEnd::Heading(_)
+            | TagEnd::BlockQuote(_)
+            | TagEnd::CodeBlock
+            | TagEnd::HtmlBlock
+            | TagEnd::List(_)
+            | TagEnd::Item
+            | TagEnd::FootnoteDefinition
+            | TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition
+            | TagEnd::Table
+            | TagEnd::TableHead
+            | TagEnd::TableRow
+            | TagEnd::TableCell
+            | TagEnd::MetadataBlock(_)
+    )
 }
 
 /// Finds bare addresses (http://, https://, www.) in text. Linear time: candidates are found
@@ -506,7 +719,38 @@ impl<'a> R<'a> {
     }
 
     fn cur_align(&self) -> Align {
-        *self.align.last().unwrap_or(&Align::Left)
+        self.align.last().map_or(Align::Left, |a| a.align)
+    }
+
+    fn push_align(&mut self, align: Align, tag: &str, block: bool) {
+        self.align.push(AlignEntry { align, tag: tag.to_string(), block });
+    }
+
+    /// A closing tag ends the alignment of its own opening tag (not whatever is on top).
+    fn pop_align(&mut self, tag: &str) {
+        if let Some(pos) = self.align.iter().rposition(|a| a.tag == tag) {
+            self.align.truncate(pos);
+        }
+    }
+
+    /// At a block boundary, alignments of unclosed `<p>`/`<h1>`… end.
+    fn end_block_aligns(&mut self) {
+        if self.align.iter().any(|a| a.block) {
+            self.align.retain(|a| !a.block);
+        }
+    }
+
+    /// Rolls back what a dropped (cut-off) table had added: see TableBase.
+    fn drop_table_state(&mut self, b: TableBase) {
+        self.inline_stack.truncate(b.inline);
+        self.emitted_groups = b.emitted;
+        self.html_groups.truncate(b.html_groups);
+        self.link_text.truncate(b.link_text);
+        self.html_links = b.html_links;
+        self.links.truncate(b.links);
+        self.images.truncate(b.images);
+        self.anchors.truncate(b.anchors);
+        self.data_budget = b.data_budget;
     }
 
     fn open_para_kind(&mut self, kind: ParaKind) {
@@ -587,10 +831,12 @@ impl<'a> R<'a> {
             p.push_str("\\b");
         }
         p.push(' ');
-        if let Some(b) = self.pending_bullet.take() {
-            p.push_str(&b);
+        let bullet = self.pending_bullet.take();
+        if let Some(b) = &bullet {
+            p.push_str(b);
         }
         self.out.push_str(&p);
+        self.bullet_at = bullet.map(|b| (self.out.len() - b.len(), self.out.len()));
     }
 
     fn open_para(&mut self) {
@@ -613,9 +859,7 @@ impl<'a> R<'a> {
                 self.link_end();
             }
             // Unclosed HTML groups (<b> without </b>) are closed at the paragraph boundary.
-            while self.html_groups.pop().is_some() {
-                self.close_group();
-            }
+            while self.pop_html_group() {}
             if self.row_open {
                 self.out.push_str("\\cell\\row\n");
                 self.row_open = false;
@@ -651,7 +895,7 @@ impl<'a> R<'a> {
         }
         self.open_para();
         let o = self.o();
-        esc_into(o, s, "\\line ");
+        text_into(o, s, "\\line ");
     }
 
     fn text(&mut self, s: &str) {
@@ -814,7 +1058,7 @@ impl<'a> R<'a> {
             let part = &body[r];
             let cf = match kind {
                 Kind::Plain => {
-                    esc_into(&mut o, part, "\\line ");
+                    text_into(&mut o, part, "\\line ");
                     continue;
                 }
                 Kind::Keyword => C_SYN_KW,
@@ -826,7 +1070,7 @@ impl<'a> R<'a> {
                 Kind::Attr => C_SYN_ATTR,
             };
             let _ = write!(o, "{{\\cf{cf}{} ", if kind == Kind::Comment { "\\i" } else { "" });
-            esc_into(&mut o, part, "\\line ");
+            text_into(&mut o, part, "\\line ");
             o.push('}');
         }
         o.push_str("\\cell\\row\n");
@@ -836,6 +1080,11 @@ impl<'a> R<'a> {
     }
 
     fn hr(&mut self) {
+        // In a table cell (<hr> as inline HTML) a rule row is impossible: a line break instead.
+        if let Some(t) = self.table.as_mut() {
+            t.cur.push_str("\\line ");
+            return;
+        }
         self.close_para();
         self.maybe_split();
         let li = self.indent();
@@ -942,14 +1191,54 @@ impl<'a> R<'a> {
         }
     }
 
+    /// Hiding by <script>/<style>/<textarea> survives block boundaries (see html::skip_spans_blocks).
+    fn skip_spans_blocks(&self) -> bool {
+        matches!(&self.html_skip, Some((n, _)) if html::skip_spans_blocks(n))
+    }
+
     fn event(&mut self, ev: Event) {
-        // Inside <script>/<style>/... skip everything up to the closing tag.
-        if self.html_skip.is_some() {
-            match &ev {
-                Event::Html(s) | Event::InlineHtml(s) => self.html(s),
-                _ => {}
+        // HTML blocks arrive line by line: collect the whole block and tokenize it once, so that
+        // comments and tags spanning several lines are understood.
+        match &ev {
+            Event::Start(Tag::HtmlBlock) => {
+                if !self.skip_spans_blocks() {
+                    self.close_para();
+                }
+                self.html_block = Some(String::new());
+                return;
             }
-            return;
+            Event::Html(s) => {
+                match self.html_block.as_mut() {
+                    Some(b) => b.push_str(s),
+                    None => self.html(s),
+                }
+                return;
+            }
+            Event::End(TagEnd::HtmlBlock) => {
+                if let Some(b) = self.html_block.take() {
+                    self.html(&b);
+                }
+                // A block boundary: also ends the hiding by an unclosed <iframe>, <form>… (close_para).
+                if !self.skip_spans_blocks() {
+                    self.close_para();
+                }
+                self.end_block_aligns();
+                return;
+            }
+            _ => {}
+        }
+        // Inside <script>/<style>/... skip everything up to the closing tag. Other hiding
+        // elements (<iframe>, <form>…) left unclosed stop hiding at the end of their block.
+        if self.html_skip.is_some() {
+            let block_end = matches!(&ev, Event::End(t) if is_block_end(t));
+            if block_end && !self.skip_spans_blocks() {
+                self.html_skip = None;
+            } else {
+                if let Event::InlineHtml(s) = &ev {
+                    self.html(s);
+                }
+                return;
+            }
         }
         if let Some((lang, buf)) = self.code.as_mut() {
             match ev {
@@ -974,7 +1263,13 @@ impl<'a> R<'a> {
         }
         match ev {
             Event::Start(tag) => self.start(tag),
-            Event::End(tag) => self.end(tag),
+            Event::End(tag) => {
+                let block_end = is_block_end(&tag);
+                self.end(tag);
+                if block_end {
+                    self.end_block_aligns();
+                }
+            }
             Event::Text(t) => self.text(&t),
             Event::Code(t) => {
                 if let Some(img) = self.image.as_mut() {
@@ -1002,13 +1297,15 @@ impl<'a> R<'a> {
                 esc_into(o, &t, " ");
                 let _ = write!(o, "{INLINE_PAD}}}");
             }
-            Event::InlineMath(t) => {
-                self.open_para();
-                let o = self.o();
-                let _ = write!(o, "{{\\f1\\fs20\\i\\cf{C_ACCENT} ");
-                esc_into(o, &t, " ");
-                o.push('}');
+            // Math in alt text is part of the alt text.
+            Event::InlineMath(t) | Event::DisplayMath(t) if self.image.is_some() => {
+                if let Some(img) = self.image.as_mut() {
+                    img.alt.push_str(&t);
+                }
             }
+            Event::InlineMath(t) => self.inline_math(&t),
+            // A formula block can't be put into a table cell: there it is shown like inline math.
+            Event::DisplayMath(t) if self.table.is_some() => self.inline_math(&t),
             Event::DisplayMath(t) => self.code_block("", &t, Some(tr!("formula", "формула"))),
             Event::Html(s) | Event::InlineHtml(s) => self.html(&s),
             Event::FootnoteReference(label) => {
@@ -1037,12 +1334,26 @@ impl<'a> R<'a> {
                 let sym = if checked { "\\u9745?" } else { "\\u9744?" };
                 let b = format!("{{\\f2\\cf{C_ACCENT} {sym}}}\\tab ");
                 if self.para_open {
+                    // Loose list: the item's paragraph is already open with the bullet just written.
+                    if let Some((a, z)) = self.bullet_at.take() {
+                        if self.table.is_none() && self.out.len() == z {
+                            self.out.truncate(a);
+                        }
+                    }
                     self.o().push_str(&b);
                 } else {
                     self.pending_bullet = Some(b);
                 }
             }
         }
+    }
+
+    fn inline_math(&mut self, t: &str) {
+        self.open_para();
+        let o = self.o();
+        let _ = write!(o, "{{\\f1\\fs20\\i\\cf{C_ACCENT} ");
+        esc_into(o, t, " ");
+        o.push('}');
     }
 
     fn start(&mut self, tag: Tag) {
@@ -1101,7 +1412,8 @@ impl<'a> R<'a> {
                 self.close_para();
                 self.code = Some((String::new(), String::new()));
             }
-            Tag::HtmlBlock => self.close_para(),
+            // Collected and rendered in event().
+            Tag::HtmlBlock => {}
             Tag::List(start) => {
                 self.close_para();
                 self.lists.push(ListState { ordered: start.is_some(), next: start.unwrap_or(1) });
@@ -1135,6 +1447,17 @@ impl<'a> R<'a> {
             }
             Tag::Table(aligns) => {
                 self.close_para();
+                let base = TableBase {
+                    inline: self.inline_stack.len(),
+                    emitted: self.emitted_groups,
+                    html_groups: self.html_groups.len(),
+                    link_text: self.link_text.len(),
+                    html_links: self.html_links,
+                    links: self.links.len(),
+                    images: self.images.len(),
+                    anchors: self.anchors.len(),
+                    data_budget: self.data_budget,
+                };
                 self.table = Some(TableState {
                     aligns,
                     rows: Vec::new(),
@@ -1142,6 +1465,8 @@ impl<'a> R<'a> {
                     cur: String::new(),
                     cur_len: 0,
                     in_head: false,
+                    bytes: 0,
+                    base,
                 });
             }
             Tag::TableHead => {
@@ -1192,9 +1517,14 @@ impl<'a> R<'a> {
                     self.open_group("{\\sub ");
                 }
             }
-            Tag::Link { dest_url, .. } => {
+            Tag::Link { link_type, dest_url, .. } => {
                 if self.image.is_none() {
-                    self.link_start(&dest_url);
+                    // <me@example.com> comes without the scheme: without mailto: it would be a file name.
+                    if link_type == LinkType::Email && !dest_url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("mailto:")) {
+                        self.link_start(&format!("mailto:{dest_url}"));
+                    } else {
+                        self.link_start(&dest_url);
+                    }
                 }
             }
             Tag::Image { dest_url, .. } => {
@@ -1227,8 +1557,8 @@ impl<'a> R<'a> {
                 self.close_para();
                 self.quote_depth = self.quote_depth.saturating_sub(1);
             }
-            TagEnd::CodeBlock | TagEnd::MetadataBlock(_) => {}
-            TagEnd::HtmlBlock => self.close_para(),
+            // Handled in event().
+            TagEnd::CodeBlock | TagEnd::MetadataBlock(_) | TagEnd::HtmlBlock => {}
             TagEnd::List(_) => {
                 self.close_para();
                 self.lists.pop();
@@ -1275,13 +1605,17 @@ impl<'a> R<'a> {
                 }
             }
             TagEnd::TableCell => {
-                // Unclosed HTML groups inside a cell are closed here.
-                while self.html_groups.pop().is_some() {
-                    self.close_group();
+                // An unclosed <a href> and unclosed HTML groups end with the cell: a group opened
+                // in one cell must not span other cells or rows.
+                while self.html_links > 0 {
+                    self.html_links -= 1;
+                    self.link_end();
                 }
+                while self.pop_html_group() {}
                 if let Some(t) = self.table.as_mut() {
                     let rtf = std::mem::take(&mut t.cur);
                     let len = t.cur_len;
+                    t.bytes += rtf.len();
                     t.cur_row.push(CellOut { rtf, plain_len: len });
                 }
             }
@@ -1390,12 +1724,12 @@ impl<'a> R<'a> {
                                 _ => None,
                             };
                             let al = al.unwrap_or(self.cur_align());
-                            self.align.push(al);
+                            self.push_align(al, n, n == "p");
                         }
                         "li" => {
                             self.close_para();
                             self.open_para();
-                            let _ = write!(self.out, "{{\\cf{C_MUTED} \\u8226?}} ");
+                            let _ = write!(self.o(), "{{\\cf{C_MUTED} \\u8226?}} ");
                         }
                         "td" | "th" => {
                             self.open_para();
@@ -1414,7 +1748,7 @@ impl<'a> R<'a> {
                                 Some(a) if a == "right" => Align::Right,
                                 _ => self.cur_align(),
                             };
-                            self.align.push(al);
+                            self.push_align(al, n, true);
                             self.open_para_kind(ParaKind::Heading(l));
                         }
                         "b" | "strong" => self.html_group("{\\b ", &name),
@@ -1444,24 +1778,14 @@ impl<'a> R<'a> {
                                 self.link_end();
                             }
                         }
-                        "p" | "div" | "center" | "section" | "article" | "header" | "footer" | "figure" | "details" | "dl" | "dd" | "dt" | "ul" | "ol" | "table" | "tr" => {
+                        "p" | "div" | "center" | "section" | "article" | "header" | "footer" | "figure" | "details" | "dl" | "dd" | "dt" | "ul" | "ol" | "table" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                             self.close_para();
-                            self.align.pop();
-                        }
-                        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                            self.close_para();
-                            self.align.pop();
+                            self.pop_align(n);
                         }
                         "li" => self.close_para(),
                         "summary" => {
                             self.close_html_group("summary");
                             self.close_para();
-                        }
-                        "code" | "kbd" | "samp" | "tt" => {
-                            if self.para_open && self.html_groups.iter().any(|g| g == n) {
-                                self.o().push_str(INLINE_PAD);
-                            }
-                            self.close_html_group(n)
                         }
                         _ => self.close_html_group(n),
                     }
@@ -1495,7 +1819,24 @@ impl<'a> R<'a> {
         }
         self.open_para();
         self.open_group(open);
-        self.html_groups.push(name.to_string());
+        // A `code` pill opened with INLINE_PAD gets the closing one however it is closed:
+        // </code>, an alias (</kbd>), the end of the paragraph or the cell.
+        let pad = matches!(name, "code" | "kbd" | "samp" | "tt") && self.inline_stack.last() == Some(&true);
+        self.html_groups.push((name.to_string(), pad));
+    }
+
+    /// Closes the innermost open HTML group; false if there is none.
+    fn pop_html_group(&mut self) -> bool {
+        match self.html_groups.pop() {
+            Some((_, pad)) => {
+                if pad {
+                    self.o().push_str(INLINE_PAD);
+                }
+                self.close_group();
+                true
+            }
+            None => false,
+        }
     }
 
     fn close_html_group(&mut self, name: &str) {
@@ -1509,11 +1850,9 @@ impl<'a> R<'a> {
                 x => x,
             }
         }
-        if let Some(pos) = self.html_groups.iter().rposition(|g| alias(g) == alias(name)) {
-            let n = self.html_groups.len() - pos;
-            for _ in 0..n {
-                self.html_groups.pop();
-                self.close_group();
+        if let Some(pos) = self.html_groups.iter().rposition(|(g, _)| alias(g) == alias(name)) {
+            while self.html_groups.len() > pos {
+                self.pop_html_group();
             }
         }
     }
@@ -1743,7 +2082,10 @@ mod tests {
             let out = r(&md);
             let _ = crate::styler::analyze(&md, true, Some(0));
             let el = t.elapsed();
-            assert!(el < std::time::Duration::from_secs(10), "{name}: {el:?}");
+            // The limit catches quadratic blow-ups, not exact speed: a debug build with coverage
+            // instrumentation (scripts\coverage.ps1) is 10–20× slower than release.
+            let limit = std::time::Duration::from_secs(if cfg!(debug_assertions) { 120 } else { 10 });
+            assert!(el < limit, "{name}: {el:?}");
             // RTF group balance (ignoring escaped braces)
             let mut depth: i64 = 0;
             let b = out.rtf.as_bytes();
@@ -1778,12 +2120,7 @@ mod tests {
     /// Real RichEdit: what the even right edge of the column relies on (app.rs column):
     /// 1) EM_SETMARGINS margins are multiplied by the zoom and may be wider than the window (at 50%);
     /// 2) a table (code blocks, rules) is no wider than 22 inches = 31680 twips.
-    /// Tests on real RichEdit run one at a time: in parallel (windows on different threads)
-    /// the pixel check occasionally saw an empty frame.
-    fn richedit_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    use crate::testutil::richedit_lock;
 
     #[test]
     fn richedit_layout_assumptions() {
@@ -1843,5 +2180,1426 @@ mod tests {
             assert!(tr <= want_r && tr >= want_r - glyph, "zoom {zoom}%: text extends to {tr} on the right, expected ≈{want_r}");
             assert!((cr - want_cell).abs() <= 3, "zoom {zoom}%: table extends to {cr}, expected {want_cell}");
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Helpers for the tests below (pure rendering, no RichEdit control involved).
+
+    fn rd(md: &str) -> Rendered {
+        let t = Theme::dark();
+        render(md, &RenderOpts::new(&t, 9000))
+    }
+
+    /// The document body without the RTF header.
+    fn body(out: &Rendered) -> &str {
+        &out.rtf[out.body_start..]
+    }
+
+    /// Text escaped exactly as the renderer escapes document text.
+    fn e(s: &str) -> String {
+        let mut o = String::new();
+        esc_into(&mut o, s, " ");
+        o
+    }
+
+    /// `\uN?` form of an internal marker code.
+    fn m(code: u32) -> String {
+        format!("\\u{}?", code as u16 as i16)
+    }
+
+    /// First RTF line (paragraph / table row) containing `needle`.
+    fn line_with<'a>(rtf: &'a str, needle: &str) -> &'a str {
+        rtf.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("no line with {needle:?} in:\n{rtf}"))
+    }
+
+    /// RTF group depth ignoring escaped braces: (final depth, minimum, maximum).
+    fn depth_stats(rtf: &str) -> (i64, i64, i64) {
+        let (mut d, mut min, mut max) = (0i64, 0i64, 0i64);
+        let b = rtf.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'\\' => i += 1,
+                b'{' => {
+                    d += 1;
+                    max = max.max(d);
+                }
+                b'}' => {
+                    d -= 1;
+                    min = min.min(d);
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        (d, min, max)
+    }
+
+    fn assert_balanced(rtf: &str, what: &str) {
+        let (d, min, _) = depth_stats(rtf);
+        assert!(min >= 0, "{what}: a '}}' closes more groups than were opened");
+        assert_eq!(d, 0, "{what}: unbalanced RTF groups");
+    }
+
+    /// Splits RTF into control words / symbols: `\pard` → "pard", `\{` → "{", `\u-3?` → "u".
+    fn control_words(rtf: &str) -> Vec<&str> {
+        let b = rtf.as_bytes();
+        let mut v = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] != b'\\' {
+                i += 1;
+                continue;
+            }
+            let st = i + 1;
+            let mut j = st;
+            while j < b.len() && b[j].is_ascii_alphabetic() {
+                j += 1;
+            }
+            if j == st {
+                let end = (st + 1).min(b.len());
+                v.push(&rtf[st..end]);
+                i = end;
+            } else {
+                v.push(&rtf[st..j]);
+                i = j;
+            }
+        }
+        v
+    }
+
+    /// Values of all `\uN?` escapes as UTF-16 code units (escaped backslashes are skipped;
+    /// `\ul`, `\uld`, `\uc1` are control words, not character escapes).
+    fn units(rtf: &str) -> Vec<u16> {
+        let b = rtf.as_bytes();
+        let mut v = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] != b'\\' {
+                i += 1;
+                continue;
+            }
+            if b.get(i + 1) == Some(&b'u') {
+                let n = b[i + 2..].iter().take_while(|c| c.is_ascii_digit() || **c == b'-').count();
+                if n > 0 && b.get(i + 2 + n) == Some(&b'?') {
+                    v.push(rtf[i + 2..i + 2 + n].parse::<i16>().unwrap() as u16);
+                    i += 3 + n;
+                    continue;
+                }
+            }
+            i += 2;
+        }
+        v
+    }
+
+    /// Leading decimal number of `s` (for `\cellx123\...`).
+    fn lead_num(s: &str) -> i32 {
+        s.bytes().take_while(u8::is_ascii_digit).fold(0, |a, d| a * 10 + (d - b'0') as i32)
+    }
+
+    fn is_marker_unit(u: u16) -> bool {
+        (0xE000..=0xF8FF).contains(&u)
+    }
+
+    /// Control words the renderer itself emits; anything else in the output is an injection.
+    const ALLOWED_WORDS: &[&str] = &[
+        "rtf", "ansi", "ansicpg", "deff", "uc", "fonttbl", "f", "fswiss", "fmodern", "fnil", "fcharset", "colortbl", "red",
+        "green", "blue", "viewkind", "pard", "plain", "par", "sb", "sa", "sl", "slmult", "fs", "cf", "b", "i", "ul", "uld",
+        "strike", "super", "sub", "highlight", "v", "u", "line", "tab", "ql", "qc", "qr", "li", "fi", "tx", "intbl", "trowd",
+        "trgaph", "trleft", "trpaddl", "trpaddr", "trpaddt", "trpaddb", "trpaddfl", "trpaddfr", "trpaddft", "trpaddfb",
+        "trhdr", "clbrdrl", "clbrdrr", "clbrdrt", "clbrdrb", "brdrs", "brdrw", "brdrcf", "clcbpat", "cellx", "cell", "row",
+        "\\", "{", "}", "~",
+    ];
+
+    /// Security invariants of any rendered document:
+    /// ASCII only, balanced groups, only the renderer's own control words,
+    /// hidden text (`\v`) only for markers, and exactly as many PUA marker units
+    /// as there are collected links/anchors/images (document text cannot forge one).
+    fn check_safe(out: &Rendered, what: &str) {
+        assert!(out.rtf.is_ascii(), "{what}: non-ASCII byte in RTF");
+        assert_balanced(&out.rtf, what);
+        assert!(out.rtf.starts_with("{\\rtf1\\ansi"), "{what}: header");
+        assert!(out.rtf.ends_with("}\n"), "{what}: closing brace");
+        for w in control_words(&out.rtf) {
+            assert!(ALLOWED_WORDS.contains(&w), "{what}: unexpected control word \\{w}");
+        }
+        // Every hidden group starts with a marker unit.
+        let mut rest = out.rtf.as_str();
+        while let Some(p) = rest.find("{\\v") {
+            rest = &rest[p + 3..];
+            let u = units(&rest[..rest.len().min(16)]);
+            assert!(rest.starts_with("\\u") && u.first().is_some_and(|&u| is_marker_unit(u)), "{what}: hidden text without a marker");
+        }
+        let markers = units(&out.rtf).into_iter().filter(|&u| is_marker_unit(u)).count();
+        let expected = 2 * out.links.len() + out.anchors.len() + 2 * out.images.len();
+        assert_eq!(markers, expected, "{what}: PUA units vs links {} / anchors {} / images {}", out.links.len(), out.anchors.len(), out.images.len());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Escaping
+
+    #[test]
+    fn esc_into_handles_every_special_char() {
+        let cases: &[(&str, &str)] = &[
+            ("\\", "\\\\"),
+            ("{", "\\{"),
+            ("}", "\\}"),
+            ("\t", "\\tab "),
+            ("a\nb", "a<NL>b"),
+            ("a\r\nb", "a<NL>b"),
+            ("\u{A0}", "\\~"),
+            ("\u{1}\u{8}\u{B}\u{C}\u{1B}\u{1F}\u{7F}", ""),
+            ("plain ASCII ~!@#$%^&*()[]<>|", "plain ASCII ~!@#$%^&*()[]<>|"),
+            ("\u{80}", "\\u128?"),
+            ("Ж", "\\u1046?"),
+            ("\u{7FFF}", "\\u32767?"),
+            ("\u{8000}", "\\u-32768?"),
+            ("\u{FFFD}", "\\u-3?"),
+            ("\u{FFFF}", "\\u-1?"),
+            // Astral characters become UTF-16 surrogate pairs.
+            ("😀", "\\u-10179?\\u-8704?"),
+            ("\u{F0000}", "\\u-9344?\\u-9216?"),
+            // U+202F is reserved for inline-code padding: the document's own becomes a thin space.
+            ("\u{202F}", "\\u8201?"),
+            ("\u{2009}", "\\u8201?"),
+            // The whole BMP Private Use Area is reserved for markers.
+            ("\u{E000}\u{E800}\u{EC00}\u{F8FD}\u{F8FE}\u{F8FF}", "\\u-3?\\u-3?\\u-3?\\u-3?\\u-3?\\u-3?"),
+            // The first character after the PUA is an ordinary one.
+            ("\u{F900}", "\\u-1792?"),
+        ];
+        for (input, want) in cases {
+            let mut o = String::new();
+            esc_into(&mut o, input, "<NL>");
+            assert_eq!(&o, want, "input {input:?}");
+        }
+        // Appends, does not overwrite.
+        let mut o = String::from("x");
+        esc_into(&mut o, "{", "");
+        assert_eq!(o, "x\\{");
+    }
+
+    /// Every Unicode scalar value: the output is ASCII, contains only the expected escapes,
+    /// never a raw brace or a PUA code unit, and drops nothing but control characters.
+    #[test]
+    fn esc_into_exhaustive_invariants() {
+        let all: String = (0..=0x10FFFFu32).filter_map(char::from_u32).collect();
+        let mut o = String::with_capacity(all.len() * 5);
+        esc_into(&mut o, &all, "\\line ");
+        assert!(o.is_ascii());
+        let b = o.as_bytes();
+        let (mut i, mut units, mut raw) = (0usize, 0usize, 0usize);
+        while i < b.len() {
+            match b[i] {
+                b'{' | b'}' => panic!("unescaped brace at {i}"),
+                b'\\' => {
+                    let rest = &o[i + 1..];
+                    if rest.starts_with(['\\', '{', '}', '~']) {
+                        i += 2;
+                    } else if rest.starts_with("tab ") {
+                        i += 5;
+                    } else if rest.starts_with("line ") {
+                        i += 6;
+                    } else if let Some(r) = rest.strip_prefix('u') {
+                        let end = r.find('?').expect("\\uN without '?'");
+                        let unit = r[..end].parse::<i16>().expect("\\uN value") as u16;
+                        assert!(!is_marker_unit(unit), "PUA unit {unit:#x} leaked");
+                        units += 1;
+                        i += 2 + end + 1;
+                    } else {
+                        panic!("unexpected escape at {i}: {}", &o[i..(i + 12).min(o.len())]);
+                    }
+                }
+                c => {
+                    assert!((0x20..0x7F).contains(&c), "raw byte {c:#x}");
+                    raw += 1;
+                    i += 1;
+                }
+            }
+        }
+        // 0x80..=0xFFFF without surrogates and U+00A0, plus two units per astral character.
+        assert_eq!(units, (0x10000 - 0x80 - 0x800 - 1) + 2 * 0x100000);
+        // Printable ASCII except the three escaped characters.
+        assert_eq!(raw, 95 - 3);
+    }
+
+    /// `text_into` only wraps emoji and symbol runs in a font group: with the groups removed the
+    /// output is exactly `esc_into`, so the emoji handling cannot weaken the escaping.
+    #[test]
+    fn text_into_only_adds_emoji_font_groups() {
+        fn strip_font_groups(s: &str) -> String {
+            let mut out = String::new();
+            let mut rest = s;
+            while let Some(p) = [rest.find("{\\f3 "), rest.find("{\\f2 ")].into_iter().flatten().min() {
+                out.push_str(&rest[..p]);
+                let after = &rest[p + 5..];
+                let close = after.find('}').expect("unclosed font group");
+                out.push_str(&after[..close]);
+                rest = &after[close + 1..];
+            }
+            out.push_str(rest);
+            out
+        }
+        let mut inputs: Vec<String> = [
+            "", "plain text", "a🟡b", "👍🏽 ok", "👨\u{200D}👩\u{200D}👧!", "1\u{FE0F}\u{20E3} #\u{FE0F}\u{20E3} 1", "☺\u{FE0E} text", "☺\u{FE0F} emoji",
+            "{\\}🎉{\\par}", "ж😀\u{E000}\u{202F}\t\r\n\u{A0}x", "\u{200D}\u{FE0F}\u{20E3}", "🏴\u{E0067}\u{E0062}\u{E007F}",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // Whole symbol and pictograph blocks, with ASCII and text in between.
+        inputs.push((0x2300..0x2C00u32).chain(0x1F000..0x1FB00).filter_map(char::from_u32).flat_map(|c| [c, 'a', c, '\u{FE0F}', ' ']).collect());
+        for s in &inputs {
+            let mut t = String::new();
+            text_into(&mut t, s, "\\line ");
+            let mut e = String::new();
+            esc_into(&mut e, s, "\\line ");
+            assert!(t.is_ascii(), "{s:?}");
+            assert_balanced(&format!("{{{t}}}"), s);
+            assert_eq!(strip_font_groups(&t), e, "{s:?}");
+        }
+        let mut t = String::new();
+        text_into(&mut t, "a🟡b", " ");
+        assert!(t.contains("{\\f3 ") && t.starts_with('a') && t.ends_with('b'), "{t}");
+    }
+
+    #[test]
+    fn emoji_and_symbols_get_their_fonts() {
+        let t = |s: &str| {
+            let mut o = String::new();
+            text_into(&mut o, s, " ");
+            o
+        };
+        assert_eq!(t("plain"), "plain");
+        assert_eq!(t("Ж"), "\\u1046?");
+        // Emoji: one group per run of adjacent clusters.
+        assert_eq!(t("a✅b"), "a{\\f3 \\u9989?}b");
+        assert_eq!(t("✅❌ x"), "{\\f3 \\u9989?\\u10060?} x");
+        // A text-default symbol: Segoe UI Symbol; with U+FE0F — an emoji; with U+FE0E — text.
+        assert_eq!(t("✔ done"), "{\\f2 \\u10004?} done");
+        assert_eq!(t("☺\u{FE0F}"), "{\\f3 \\u9786?\\u-497?}");
+        assert_eq!(t("✅\u{FE0E}"), "{\\f2 \\u9989?\\u-498?}");
+        // An emoji next to a symbol: two groups.
+        assert_eq!(t("✅✔"), "{\\f3 \\u9989?}{\\f2 \\u10004?}");
+        // Keycap: ASCII base + U+FE0F + U+20E3; a bare digit with U+FE0F stays text.
+        assert_eq!(t("1\u{FE0F}\u{20E3}"), "{\\f3 1\\u-497?\\u8419?}");
+        assert_eq!(t("1\u{FE0F}"), "1\\u-497?");
+        // A lone joiner is not an emoji.
+        assert_eq!(t("a\u{200D}b"), "a\\u8205?b");
+
+        let u = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        assert!(emoji_clusters(&u("plain text, кириллица")).is_empty());
+        // ZWJ family, two flags, a keycap, a symbol (skipped), a two-unit emoji.
+        assert_eq!(
+            emoji_clusters(&u("a👨\u{200D}👩\u{200D}👧 b🇺🇸🇩🇪 1\u{FE0F}\u{20E3}✔🟡")),
+            vec![(1, 9), (11, 15), (15, 19), (20, 23), (24, 26)]
+        );
+        // Skin tone joins its emoji; an unpaired surrogate keeps positions.
+        assert_eq!(emoji_clusters(&u("👍🏽!")), vec![(0, 4)]);
+        assert_eq!(emoji_clusters(&[0xD800, 0x2705, 0x41]), vec![(1, 2)]);
+        // Symbols too, for the editor: ✔ and ☺︎ are symbols, the rest emoji.
+        assert_eq!(symbol_clusters(&u("x✔ ☺\u{FE0E}🟡")), vec![(1, 2, false), (3, 5, false), (5, 7, true)]);
+        assert!(symbol_clusters(&u("стрелки ← → не символы")).is_empty());
+    }
+
+    #[test]
+    fn document_text_is_escaped_everywhere() {
+        let evil = "{\\rtf1{\\object\\objemb{\\*\\objdata 01}}\\field{\\*\\fldinst HYPERLINK x}}";
+        let md = format!(
+            "# {evil}\n\n{evil}\n\n`{evil}`\n\n*{evil}* [{evil}](https://a.example) ![{evil}](i.png)\n\n> {evil}\n\n- {evil}\n\n| {evil} |\n|---|\n| {evil} |\n\n```\n{evil}\n```\n\n<b>{evil}</b>\n\n<div title=\"{evil}\">{evil}</div>\n\na[^{{x}}]\n\n[^{{x}}]: {evil}\n\nTerm {evil}\n: def {evil}\n\n$${evil}$$ and ${evil}$\n"
+        );
+        let out = r(&md);
+        check_safe(&out, "evil");
+        let words = control_words(&out.rtf);
+        for bad in ["object", "objemb", "objdata", "field", "fldinst", "*", "'", "bin", "pict"] {
+            assert!(!words.contains(&bad), "\\{bad} reached the RTF");
+        }
+        // The only `\rtf` is the document header.
+        assert_eq!(words.iter().filter(|w| **w == "rtf").count(), 1);
+        assert!(body(&out).contains(&e("\\objemb")));
+    }
+
+    #[test]
+    fn hostile_fixtures_and_marker_forgery_are_safe() {
+        let mut docs: Vec<(String, String)> = Vec::new();
+        for f in ["attack.md", "showcase.md", "inline-code.md"] {
+            let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join(f);
+            docs.push((f.to_string(), std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{p:?}: {e}"))));
+        }
+        // Every marker value placed where text ends up: plain text, headings, link text, alt,
+        // inline/block code, tables, HTML text and attributes, entities.
+        for c in ['\u{E000}', '\u{E001}', '\u{E7FF}', '\u{E800}', '\u{EBFF}', '\u{EC00}', '\u{F8FC}', '\u{F8FD}', '\u{F8FE}', '\u{F8FF}'] {
+            let n = c as u32;
+            docs.push((
+                format!("marker {n:#x}"),
+                format!(
+                    "# a{c}b\n\nx{c}y [l{c}](https://a.example) ![i{c}](i.png) `c{c}` &#x{n:X}; &#{n};\n\n| {c} |\n|---|\n| {c} |\n\n```\n{c}\n```\n\n<b title=\"{c}\">{c}&#x{n:X};</b> <img src=\"j.png\" alt=\"{c}\">\n"
+                ),
+            ));
+        }
+        for (name, md) in &docs {
+            let out = r(md);
+            check_safe(&out, name);
+            check_safe(&rd(md), name);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Header, themes, options
+
+    #[test]
+    fn header_matches_theme_and_body_is_theme_independent() {
+        let md = "# T\n\ntext `code` [l](https://a.example)\n\n> q\n";
+        for t in [Theme::light(), Theme::dark()] {
+            let out = render(md, &RenderOpts::new(&t, 9000));
+            let mut ct = String::from("{\\colortbl ;");
+            for c in [
+                t.fg, t.muted, t.link, t.code_bg, t.border, t.heading, t.quote, t.table_head_bg, t.code_fg, t.accent, t.warn,
+                t.syn_keyword, t.syn_type, t.syn_string, t.syn_number, t.syn_comment, t.syn_func, t.syn_attr,
+            ] {
+                ct.push_str(&format!("\\red{}\\green{}\\blue{};", theme::r(c), theme::g(c), theme::b(c)));
+            }
+            ct.push('}');
+            let header = &out.rtf[..out.body_start];
+            assert!(header.contains(&ct), "dark={}: {header}", t.dark);
+            for font in ["Segoe UI;", "Consolas;", "Segoe UI Symbol;", "Segoe UI Emoji;"] {
+                assert!(header.contains(font), "{font}");
+            }
+            assert!(header.ends_with("\\viewkind4\\uc1\n"));
+        }
+        assert_eq!(body(&r(md)), body(&rd(md)));
+    }
+
+    #[test]
+    fn padding_options_are_clamped() {
+        let t = Theme::light();
+        let first_and_tail = |top: i32, tail: i32| {
+            let mut o = RenderOpts::new(&t, 9000);
+            o.top_pad_twips = top;
+            o.tail_twips = tail;
+            let out = render("x", &o);
+            let lines: Vec<String> = body(&out).lines().map(str::to_string).collect();
+            (lines[0].clone(), lines[lines.len() - 3].clone())
+        };
+        assert_eq!(first_and_tail(-100, -1), ("\\pard\\plain\\sb0\\sa0\\fs2\\par".into(), "\\pard\\plain\\sb0\\sa0\\fs2\\par".into()));
+        assert_eq!(first_and_tail(240, 3000), ("\\pard\\plain\\sb240\\sa0\\fs2\\par".into(), "\\pard\\plain\\sb3000\\sa0\\fs2\\par".into()));
+        assert_eq!(first_and_tail(99_999, 99_999), ("\\pard\\plain\\sb2000\\sa0\\fs2\\par".into(), "\\pard\\plain\\sb30000\\sa0\\fs2\\par".into()));
+        // A very narrow column still gives usable block widths.
+        let narrow = render("```\nx\n```\n\n---\n\n> q\n", &RenderOpts::new(&t, 100));
+        let b = body(&narrow);
+        assert!(b.contains("\\clcbpat4\\cellx1500"), "{b}");
+        assert!(b.contains("\\clbrdrt\\brdrs\\brdrw25\\brdrcf5\\cellx2000"), "{b}");
+        assert!(b.contains("\\clbrdrl\\brdrs\\brdrw50\\brdrcf5\\cellx2000"), "{b}");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Headings and anchors
+
+    #[test]
+    fn slugify_rules() {
+        assert_eq!(slugify("Hello, World!"), "hello-world");
+        assert_eq!(slugify("  Привет Мир  "), "привет-мир");
+        assert_eq!(slugify("snake_case and-dash"), "snake_case-and-dash");
+        assert_eq!(slugify("C++ & Rust"), "c--rust");
+        assert_eq!(slugify("ÄÖÜ 2024"), "äöü-2024");
+        assert_eq!(slugify("emoji 🎉 here"), "emoji--here");
+        assert_eq!(slugify("tab\there"), "tabhere");
+        assert_eq!(slugify(""), "");
+    }
+
+    #[test]
+    fn headings_all_levels() {
+        let out = r("# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6\n");
+        assert_eq!(out.anchors, ["h1", "h2", "h3", "h4", "h5", "h6"]);
+        let b = body(&out);
+        let sizes = [46, 36, 30, 26, 24, 22];
+        let space = [360, 320, 260, 220, 200, 200];
+        for l in 1..=6usize {
+            let cf = if l == 6 { C_MUTED } else { C_HEADING };
+            let want = format!("\\fs{}\\cf{cf}\\b {{\\v{}}}H{l}", sizes[l - 1], m(ANCHOR + l as u32 - 1));
+            let line = line_with(b, &want);
+            // H1/H2 are a one-row table with a bottom border; H3+ are plain paragraphs.
+            if l <= 2 {
+                assert!(line.starts_with("\\pard\\plain\\intbl") && line.ends_with("\\cell\\row"), "{line}");
+            } else {
+                assert!(!line.contains("\\intbl") && line.ends_with("\\par"), "{line}");
+            }
+            assert!(line.contains(&format!("\\sl{}", sizes[l - 1] * 12)), "{line}");
+            assert!(b.contains(&format!("\\pard\\plain\\sb{}\\sa0\\fs2\\par\n", space[l - 1])), "spacer for H{l}");
+        }
+        assert_eq!(b.matches("\\clbrdrb\\brdrs\\brdrw10\\brdrcf5").count(), 2);
+        check_safe(&out, "headings");
+        // Setext headings.
+        let out = r("Title\n=====\n\nSub\n---\n");
+        assert_eq!(out.anchors, ["title", "sub"]);
+        assert!(body(&out).contains("\\fs46\\cf6\\b ") && body(&out).contains("\\fs36\\cf6\\b "));
+    }
+
+    #[test]
+    fn heading_slugs_are_unique_and_include_inline_code() {
+        let out = r("# Use `foo_bar` now\n# Dup\n# Dup\n# Dup\n## [Link](https://a.example) *em*\n\n> # In quote\n");
+        assert_eq!(out.anchors, ["use-foo_bar-now", "dup", "dup-1", "dup-2", "link-em", "in-quote"]);
+        assert_eq!(out.links.len(), 1);
+        assert_eq!(out.links[0].text, "Link");
+        let b = body(&out);
+        // Inline code is scaled to the heading size: 46 * 0.86 → 39.
+        assert!(b.contains(&format!("{{\\f1\\fs39\\cf{C_CODEFG}{INLINE_PAD}foo_bar{INLINE_PAD}}}")), "{b}");
+        // A heading inside a quote gets the quote bar, not the underline row.
+        let line = line_with(b, "In quote");
+        assert!(line.contains("\\fs46") && line.ends_with("\\cell\\row"), "{line}");
+        assert_eq!(b.matches("\\clbrdrb").count(), 5);
+        check_safe(&out, "slugs");
+    }
+
+    #[test]
+    fn anchors_are_capped() {
+        let out = r(&"# h\n\n".repeat(MAX_ANCHORS + 5));
+        assert_eq!(out.anchors.len(), MAX_ANCHORS);
+        assert_eq!(out.anchors[0], "h");
+        assert_eq!(out.anchors[MAX_ANCHORS - 1], format!("h-{}", MAX_ANCHORS - 1));
+        // Headings beyond the limit are still rendered, only without an anchor marker.
+        assert_eq!(body(&out).matches("\\fs46\\cf6\\b ").count(), MAX_ANCHORS + 5);
+        check_safe(&out, "anchors");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Inline elements
+
+    #[test]
+    fn inline_styles_and_breaks() {
+        let out = r("*i* **b** ~~s~~ ***bi*** `c`  \nx\\\ny\nz");
+        let b = body(&out);
+        assert!(b.contains("{\\i i}"), "{b}");
+        assert!(b.contains("{\\b b}"), "{b}");
+        assert!(b.contains("{\\strike s}"), "{b}");
+        assert!(b.contains("{\\i {\\b bi}}") || b.contains("{\\b {\\i bi}}"), "{b}");
+        // Body inline code: 23 * 0.86 → 19, padded by a pair of U+202F.
+        assert!(b.contains(&format!("{{\\f1\\fs19\\cf{C_CODEFG}{INLINE_PAD}c{INLINE_PAD}}}")), "{b}");
+        // Two hard breaks (two spaces, backslash) and a soft break → space.
+        assert!(b.contains("}\\line x\\line y z\\par"), "{b}");
+        check_safe(&out, "inline");
+    }
+
+    #[test]
+    fn inline_code_is_escaped_and_sized_by_context() {
+        let out = r("`{\\rtf1 \\par}` and `a\u{202F}b`\n\n| `t` |\n|---|\n| x |\n");
+        let b = body(&out);
+        assert!(b.contains(&format!("{INLINE_PAD}\\{{\\\\rtf1 \\\\par\\}}{INLINE_PAD}")), "{b}");
+        // The document's own U+202F must not look like a pill boundary.
+        assert!(b.contains(&format!("{INLINE_PAD}a\\u8201?b{INLINE_PAD}")), "{b}");
+        // Table cells use 11 pt → 22 * 0.86 → 18.
+        assert!(b.contains(&format!("{{\\f1\\fs18\\cf{C_CODEFG}{INLINE_PAD}t{INLINE_PAD}}}")), "{b}");
+        check_safe(&out, "code");
+    }
+
+    #[test]
+    fn inline_and_display_math() {
+        let out = r("x $y^2 \\{z\\}$ w\n\n$$a+b$$\n");
+        let b = body(&out);
+        assert!(b.contains(&format!("{{\\f1\\fs20\\i\\cf{C_ACCENT} y^2 \\\\\\{{z\\\\\\}}}}")), "{b}");
+        assert!(b.contains(&format!("{{\\cf{C_MUTED}\\fs17 formula}}\\line a+b\\cell\\row")), "{b}");
+        check_safe(&out, "math");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Code blocks, front matter
+
+    #[test]
+    fn code_blocks_fenced_indented_and_unknown_language() {
+        let out = r("```\n{\\object} \\par\tx\n```\n\n    indented {x}\n\n```nosuchlang extra words\nfn let\n```\n");
+        let b = body(&out);
+        assert_eq!(b.matches(&format!("\\clcbpat{C_CODEBG}\\cellx9000")).count(), 3);
+        assert!(b.contains(&format!("\\f1\\fs20\\cf{C_CODEFG} \\{{\\\\object\\}} \\\\par\\tab x\\cell\\row")), "{b}");
+        assert!(b.contains("indented \\{x\\}\\cell\\row"), "{b}");
+        // An unknown language is not highlighted.
+        assert!(b.contains(" fn let\\cell\\row"), "{b}");
+        check_safe(&out, "code blocks");
+    }
+
+    #[test]
+    fn code_block_inside_list_is_indented() {
+        let out = r("- item\n\n  ```\n  code\n  ```\n");
+        let b = body(&out);
+        assert!(b.contains(&format!("\\trleft380\\trpaddl200\\trpaddr200\\trpaddfl3\\trpaddfr3\\clcbpat{C_CODEBG}\\cellx9000")), "{b}");
+        check_safe(&out, "list code");
+    }
+
+    #[test]
+    fn front_matter_is_a_labelled_block() {
+        let out = r("---\ntitle: X {y}\ntags: [a]\n---\n\ntext\n");
+        let b = body(&out);
+        assert!(b.contains(&format!("{{\\cf{C_MUTED}\\fs17 metadata (front matter)}}\\line title: X \\{{y\\}}\\line tags: [a]\\cell\\row")), "{b}");
+        assert!(b.contains(" text\\par"));
+        check_safe(&out, "front matter");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Quotes, alerts, lists, definition lists, footnotes, rules
+
+    #[test]
+    fn blockquotes_nest_with_capped_indent() {
+        let out = r("> a\n>\n> > b\n");
+        let b = body(&out);
+        assert!(line_with(b, "a\\cell\\row").contains(&format!("\\cf{C_QUOTE} a")), "{b}");
+        assert!(b.contains(&format!("\\trleft40\\trpaddl220\\trpaddfl3\\clbrdrl\\brdrs\\brdrw50\\brdrcf{C_BORDER}")), "{b}");
+        assert!(b.contains("\\trleft360\\trpaddl220"), "{b}");
+        check_safe(&out, "quotes");
+        let deep = r(&format!("{}x", "> ".repeat(50)));
+        let max_left = body(&deep)
+            .split("\\trleft")
+            .skip(1)
+            .map(lead_num)
+            .max()
+            .unwrap();
+        assert_eq!(max_left, 7 * 320 + 40);
+        check_safe(&deep, "deep quotes");
+    }
+
+    #[test]
+    fn github_alerts_all_kinds() {
+        let kinds = [
+            ("NOTE", "Note", "\\u9432?", C_ACCENT),
+            ("TIP", "Tip", "\\u9733?", C_ACCENT),
+            ("IMPORTANT", "Important", "\\u9670?", C_ACCENT),
+            ("WARNING", "Warning", "\\u9888?", C_WARN),
+            ("CAUTION", "Caution", "\\u9940?", C_WARN),
+        ];
+        for (tag, label, sym, cf) in kinds {
+            let out = r(&format!("> [!{tag}]\n> body {{x}}\n"));
+            let b = body(&out);
+            let title = line_with(b, label);
+            assert!(title.contains(&format!("{{\\b\\cf{cf}{{\\f2 {sym}}} {label}}}")), "{tag}: {title}");
+            assert!(title.ends_with("\\cell\\row"), "{tag}: the label is inside the quote bar");
+            assert!(line_with(b, "body").contains(&format!("\\cf{C_QUOTE} body \\{{x\\}}")), "{tag}: {b}");
+            assert!(!b.contains("[!"), "{tag}: marker text shown");
+            check_safe(&out, tag);
+        }
+        // A plain quote has no label.
+        assert!(!body(&r("> plain\n")).contains("\\b\\cf"));
+    }
+
+    #[test]
+    fn list_bullets_numbers_and_spacing() {
+        let out = r("- a\n  - b\n    - c\n      - d\n");
+        let b = body(&out);
+        for (sym, text, li) in [("\\u8226?", "a", 380), ("\\u9702?", "b", 760), ("\\u9642?", "c", 1140), ("\\u8226?", "d", 1520)] {
+            let line = line_with(b, &format!("}}\\tab {text}\\par"));
+            assert!(line.contains(&format!("\\li{li}\\fi-300\\tx{li}")), "{line}");
+            assert!(line.contains(&format!("{{\\cf{C_MUTED} {sym}}}\\tab {text}")), "{line}");
+        }
+        let out = r("3. x\n4. y\n\n1) z\n");
+        let b = body(&out);
+        assert!(b.contains(" 3.\\tab x\\par") && b.contains(" 4.\\tab y\\par") && b.contains(" 1.\\tab z\\par"), "{b}");
+        // An empty item still shows its bullet.
+        let out = r("-\n- b\n");
+        assert!(body(&out).contains(&format!("{{\\cf{C_MUTED} \\u8226?}}\\tab \\par")), "{}", body(&out));
+        // A multi-paragraph item makes the following items loose.
+        let out = r("1. a\n\n   b\n2. c\n");
+        let b = body(&out);
+        assert!(line_with(b, "1.\\tab a").contains("\\sb20\\sa60"), "{b}");
+        assert!(line_with(b, "2.\\tab c").contains("\\sb0\\sa200"), "{b}");
+        // Deep nesting: the indent is capped.
+        let deep: String = (0..30).map(|i| format!("{}- x{i}\n", "  ".repeat(i))).collect();
+        let out = r(&deep);
+        assert!(line_with(body(&out), "x29\\par").contains("\\li3800\\fi-300"), "{}", line_with(body(&out), "x29"));
+        check_safe(&out, "deep list");
+    }
+
+    #[test]
+    fn task_lists_show_checkboxes() {
+        let out = r("- [ ] todo\n- [x] done\n");
+        let b = body(&out);
+        assert!(b.contains(&format!("{{\\f2\\cf{C_ACCENT} \\u9744?}}\\tab todo")), "{b}");
+        assert!(b.contains(&format!("{{\\f2\\cf{C_ACCENT} \\u9745?}}\\tab done")), "{b}");
+        // In a tight list the checkbox replaces the bullet.
+        assert!(!b.contains("\\u8226?"), "{b}");
+        // Loose list: the marker arrives inside an already open paragraph.
+        let out = r("- [ ] a\n\n- [x] b\n");
+        let b = body(&out);
+        assert!(b.contains("\\u9744?}\\tab a\\par") && b.contains("\\u9745?}\\tab b\\par"), "{b}");
+        check_safe(&out, "tasks");
+    }
+
+    #[test]
+    fn definition_lists() {
+        let out = r("Term {x}\n: First definition\n: Second\n\nAfter\n");
+        let b = body(&out);
+        let title = line_with(b, "Term");
+        assert!(title.contains("\\sb120\\sa40") && title.contains(&format!("\\cf{C_FG}\\b Term \\{{x\\}}\\par")), "{title}");
+        for d in ["First definition", "Second"] {
+            assert!(line_with(b, d).contains("\\li480\\fi0\\tx480"), "{b}");
+        }
+        // The indent ends with the list.
+        assert!(line_with(b, "After").contains("\\li0\\fi0"), "{b}");
+        check_safe(&out, "deflist");
+    }
+
+    #[test]
+    fn footnotes_link_to_their_definition() {
+        let out = r("a[^My Note] b\n\n[^My Note]: note *x*\n");
+        assert_eq!(out.links.len(), 1);
+        assert_eq!(out.links[0].url, "#fn-my-note");
+        assert_eq!(out.anchors, ["fn-my-note"]);
+        let b = body(&out);
+        assert!(b.contains(&format!("a{{\\v{}}}{{\\cf{C_LINK}\\ul {{\\super My Note}}}}{{\\v{}}} b", m(LINK_START), m(LINK_END))), "{b}");
+        let def = line_with(b, "note");
+        assert!(def.contains(&format!("\\fs19\\cf{C_MUTED} {{\\v{}}}{{\\cf{C_MUTED} My Note.\\~}}note {{\\i x}}\\par", m(ANCHOR))), "{def}");
+        // The footnote style does not leak into the following paragraph.
+        let out = r("a[^1]\n\n[^1]: n\n\nafter\n");
+        assert!(line_with(body(&out), "after").contains(&format!("\\fs23\\cf{C_FG} after")));
+        check_safe(&out, "footnotes");
+    }
+
+    #[test]
+    fn rules_markdown_and_html() {
+        for md in ["a\n\n---\n\nb", "a\n\n<hr>\n\nb", "a\n\n***\n"] {
+            let out = r(md);
+            assert_eq!(body(&out).matches(&format!("\\clbrdrt\\brdrs\\brdrw25\\brdrcf{C_BORDER}\\cellx9000")).count(), 1, "{md}");
+            check_safe(&out, md);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Links
+
+    #[test]
+    fn links_inline_reference_and_autolinks() {
+        let out = r("[inline](https://a.example/x) [ref][r] <https://auto.example> [mail](mailto:me@mail.example) www.site.example/p\n\n[r]: https://ref.example \"t\"\n");
+        let urls: Vec<&str> = out.links.iter().map(|l| l.url.as_str()).collect();
+        assert_eq!(urls, ["https://a.example/x", "https://ref.example", "https://auto.example", "mailto:me@mail.example", "https://www.site.example/p"]);
+        let texts: Vec<&str> = out.links.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["inline", "ref", "https://auto.example", "mail", "www.site.example/p"]);
+        let b = body(&out);
+        for i in 0..5 {
+            assert!(b.contains(&format!("{{\\v{}}}{{\\cf{C_LINK}\\ul ", m(LINK_START + i))), "link {i}");
+        }
+        assert_eq!(b.matches(&format!("{{\\v{}}}", m(LINK_END))).count(), 5);
+        assert!(b.contains(&format!("{{\\cf{C_LINK}\\ul inline}}{{\\v{}}}", m(LINK_END))), "{b}");
+        check_safe(&out, "links");
+    }
+
+    #[test]
+    fn link_text_collects_code_and_is_not_relinked() {
+        let out = r("[a `b` *c* https://x.example](https://y.example)");
+        assert_eq!(out.links.len(), 1);
+        assert_eq!(out.links[0].text, "a b c https://x.example");
+        check_safe(&out, "link text");
+        // Image inside a link: both are collected.
+        let out = r("[![logo](l.png)](https://x.example)");
+        assert_eq!((out.links.len(), out.images.len()), (1, 1));
+        check_safe(&out, "image link");
+    }
+
+    #[test]
+    fn blocked_oversized_and_excess_links() {
+        let out = r("[js](javascript:alert(1)) [ok](https://a.example)");
+        assert_eq!(out.links[0].url, "javascript:alert(1)");
+        let b = body(&out);
+        assert!(b.contains(&format!("{{\\cf{C_WARN}\\uld js}}")), "{b}");
+        assert!(b.contains(&format!("{{\\cf{C_LINK}\\ul ok}}")), "{b}");
+        check_safe(&out, "blocked");
+        // An address over MAX_URL_LEN is neither copied nor clickable, but the text stays visible.
+        let out = r(&format!("[big](https://e.example/{})", "a".repeat(MAX_URL_LEN)));
+        assert!(out.links.is_empty());
+        assert!(body(&out).contains(&format!("{{\\cf{C_WARN}\\uld big}}")));
+        check_safe(&out, "oversized");
+        // Beyond MAX_LINKS links are shown as links but get no markers.
+        let out = r(&"[x](https://a.example) ".repeat(MAX_LINKS + 3));
+        assert_eq!(out.links.len(), MAX_LINKS);
+        assert_eq!(body(&out).matches(&format!("{{\\cf{C_LINK}\\ul x}}")).count(), MAX_LINKS + 3);
+        check_safe(&out, "many links");
+    }
+
+    #[test]
+    fn bare_url_detection() {
+        assert_eq!(find_autolinks("x https://a.b/c_(d) y"), vec![(2, 19)]);
+        assert_eq!(find_autolinks("(https://a.b/x)"), vec![(1, 14)]);
+        assert_eq!(find_autolinks("HTTPS://A.B/X"), vec![(0, 13)]);
+        assert_eq!(find_autolinks("«https://a.b/x»"), vec![(2, 15)]);
+        assert_eq!(find_autolinks("*https://a.b*"), vec![(1, 12)]);
+        assert_eq!(find_autolinks("http://x"), vec![(0, 8)]);
+        assert_eq!(find_autolinks("a https://a.b, b http://c.d"), vec![(2, 13), (17, 27)]);
+        assert!(find_autolinks("http://").is_empty());
+        assert!(find_autolinks("www.a").is_empty());
+        assert!(find_autolinks("ahttps://a.b").is_empty());
+        assert!(find_autolinks("see:https://a.b").is_empty());
+        // Address length is capped.
+        assert_eq!(find_autolinks(&format!("https://a.b/{}", "x".repeat(5000))), vec![(0, 2048)]);
+        // Rendered: trailing punctuation is not part of the link, www. gets https://.
+        let out = r("Visit https://a.example/x. or www.b.example!");
+        let urls: Vec<&str> = out.links.iter().map(|l| l.url.as_str()).collect();
+        assert_eq!(urls, ["https://a.example/x", "https://www.b.example"]);
+        assert!(body(&out).contains(&format!("{{\\v{}}}. or ", m(LINK_END))));
+        check_safe(&out, "bare urls");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Images
+
+    #[test]
+    fn markdown_images_and_fallbacks() {
+        let out = r("![Alt *em* `code`](img.png \"title\") ![missing]() ![sp](< b.png >)");
+        assert_eq!(out.images.len(), 2);
+        assert_eq!((out.images[0].id, out.images[0].src.as_str(), out.images[0].width, out.images[0].height), (0, "img.png", None, None));
+        assert_eq!(out.images[1].src, "b.png");
+        let b = body(&out);
+        let want = format!("{{\\v{}{{\\cf{C_MUTED}\\fs20 [{{\\f3\\u-10179?\\u-8772?}} Alt em code]}}{}}}", m(IMAGE), m(IMAGE_END));
+        assert!(b.contains(&want), "{b}");
+        assert!(b.contains(&format!("{{\\v{}{{", m(IMAGE + 1))), "{b}");
+        // Without an address: a visible muted caption, nothing to load.
+        assert!(b.contains(&format!("{{\\cf{C_MUTED} [missing]}}")), "{b}");
+        // Formatting inside alt text is not emitted.
+        assert!(!b.contains("{\\i "), "{b}");
+        check_safe(&out, "images");
+        // An image nested in alt text is not loaded.
+        let out = r("![a ![b](inner.png) c](outer.png)");
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].src, "outer.png");
+        check_safe(&out, "nested image");
+        // A soft break inside alt text does not break the capture.
+        let out = r("![a\nb](x.png)");
+        assert_eq!(out.images.len(), 1);
+        check_safe(&out, "alt soft break");
+    }
+
+    #[test]
+    fn image_alt_is_capped_on_a_char_boundary() {
+        // 'ж' is 2 bytes; after the leading 'a' the 4096-byte cut falls inside a character.
+        let alt = format!("a{}", "ж".repeat(3000));
+        let out = r(&format!("![{alt}](x.png)"));
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(body(&out).matches("\\u1078?").count(), (MAX_AUX_TEXT - 1) / 2);
+        check_safe(&out, "long alt");
+    }
+
+    #[test]
+    fn image_count_and_url_limits() {
+        let out = r(&"![i](a.png) ".repeat(MAX_IMAGES + 3));
+        assert_eq!(out.images.len(), MAX_IMAGES);
+        assert_eq!(out.images[MAX_IMAGES - 1].id, MAX_IMAGES - 1);
+        assert_eq!(body(&out).matches(&format!("{{\\cf{C_MUTED} [i]}}")).count(), 3);
+        check_safe(&out, "many images");
+        // HTML images are counted against the same limit.
+        let out = r(&format!("{}\n\n<img src=\"b.png\" alt=\"h\">", "![i](a.png) ".repeat(MAX_IMAGES)));
+        assert_eq!(out.images.len(), MAX_IMAGES);
+        assert!(body(&out).contains(&format!("{{\\cf{C_MUTED} [h]}}")));
+        // A non-data address over MAX_URL_LEN is not loaded.
+        let out = r(&format!("![big](https://e.example/{})", "a".repeat(MAX_URL_LEN)));
+        assert!(out.images.is_empty());
+        assert!(body(&out).contains(&format!("{{\\cf{C_MUTED} [big]}}")));
+        check_safe(&out, "long image url");
+    }
+
+    #[test]
+    fn data_uri_size_and_budget() {
+        const PREFIX: &str = "data:image/png;base64,";
+        let uri = |len: usize| format!("{PREFIX}{}", "A".repeat(len - PREFIX.len()));
+        // One data: image over MAX_DATA_URI is rejected.
+        let out = r(&format!("![big]({})", uri(MAX_DATA_URI + 1)));
+        assert!(out.images.is_empty());
+        assert!(body(&out).contains(&format!("{{\\cf{C_MUTED} [big]}}")));
+        // The per-document budget: full-size images up to DATA_BUDGET, then data: is refused
+        // (Markdown and HTML, any letter case), while ordinary addresses still load.
+        let n = DATA_BUDGET / MAX_DATA_URI;
+        assert!(n >= 1 && n * MAX_DATA_URI <= DATA_BUDGET);
+        let mut md = String::new();
+        for _ in 0..n {
+            md.push_str(&format!("![d]({})\n\n", uri(MAX_DATA_URI)));
+        }
+        let rest = DATA_BUDGET - n * MAX_DATA_URI;
+        md.push_str(&format!("![over](DaTa:image/png;base64,{})\n\n", "A".repeat(rest.max(1) + 1)));
+        md.push_str("<img src=\"data:image/gif;base64,R0lGOD\" alt=\"html\">\n\n![n](n.png)\n");
+        let out = r(&md);
+        assert_eq!(out.images.len(), n + 1);
+        assert!(out.images[..n].iter().all(|i| i.src.len() == MAX_DATA_URI));
+        assert_eq!(out.images[n].src, "n.png");
+        let b = body(&out);
+        assert!(b.contains(&format!("{{\\cf{C_MUTED} [over]}}")) && b.contains(&format!("{{\\cf{C_MUTED} [html]}}")), "fallbacks");
+        // A small HTML data: image is fine on its own.
+        let out = r("<img src=\" DATA:image/png;base64,AAAA \">");
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].src, "DATA:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn image_in_table_cell() {
+        let out = r("| a | b |\n|---|---|\n| ![p](p.png) | x |\n");
+        assert_eq!(out.images.len(), 1);
+        let b = body(&out);
+        assert!(line_with(b, &m(IMAGE)).contains("\\intbl"), "{b}");
+        check_safe(&out, "table image");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Tables
+
+    #[test]
+    fn tables_alignment_header_and_cells() {
+        let out = r("| L | C | R | N |\n|:--|:-:|--:|---|\n| {a} | `c` | \\| | x |\n| only |\n");
+        let b = body(&out);
+        let head = line_with(b, "\\b L\\cell");
+        for (al, text) in [("\\ql", "L"), ("\\qc", "C"), ("\\qr", "R"), ("\\ql", "N")] {
+            assert!(head.contains(&format!("\\intbl{al}\\sb40\\sa40\\f0\\fs22\\cf{C_FG}\\b {text}\\cell")), "{head}");
+        }
+        let head_def = b.lines().find(|l| l.contains("\\trhdr")).unwrap();
+        assert_eq!(head_def.matches(&format!("\\clcbpat{C_THEAD}")).count(), 4);
+        let row = line_with(b, "\\{a\\}");
+        assert!(row.contains(&format!("\\intbl\\ql\\sb40\\sa40\\f0\\fs22\\cf{C_FG} \\{{a\\}}\\cell")), "{row}");
+        assert!(row.contains(&format!("\\intbl\\qc\\sb40\\sa40\\f0\\fs22\\cf{C_FG} {{\\f1\\fs18")), "{row}");
+        assert!(row.contains(&format!("\\intbl\\qr\\sb40\\sa40\\f0\\fs22\\cf{C_FG} |\\cell")), "{row}");
+        // Short rows are padded to the column count.
+        let short = line_with(b, " only\\cell");
+        assert_eq!(short.matches("\\cell").count(), 4, "{short}");
+        assert!(short.ends_with("\\row"));
+        assert_eq!(b.matches("\\row\n").count(), 3);
+        check_safe(&out, "table");
+    }
+
+    #[test]
+    fn table_columns_are_capped_and_widths_fit() {
+        let ncols = 70;
+        let mut md = (0..ncols).map(|i| format!("| c{i} ")).collect::<String>() + "|\n";
+        md += &"|---".repeat(ncols);
+        md += "|\n";
+        let out = r(&md);
+        let b = body(&out);
+        let head = line_with(b, "\\b c0\\cell");
+        assert_eq!(head.matches("\\cell").count(), 60);
+        assert!(head.contains("c59\\cell") && !b.contains("c60"), "{head}");
+        let def = b.lines().find(|l| l.contains("\\trhdr")).unwrap();
+        let xs: Vec<i32> = def.split("\\cellx").skip(1).map(lead_num).collect();
+        assert_eq!(xs.len(), 60);
+        assert!(xs.windows(2).all(|w| w[1] > w[0]));
+        // Each column at least 500 twips, the table no wider than RichEdit's 22 inches.
+        assert!(xs[0] >= 500 && *xs.last().unwrap() <= 31680, "{xs:?}");
+        check_safe(&out, "wide table");
+        // Long cells are scaled to the column width.
+        let long = "w".repeat(80);
+        let out = r(&format!("|{0}|{0}|{0}|\n|-|-|-|\n|{0}|{0}|{0}|\n", long));
+        let def = body(&out).lines().find(|l| l.contains("\\trhdr")).unwrap().to_string();
+        let xs: Vec<i32> = def.split("\\cellx").skip(1).map(lead_num).collect();
+        assert!(*xs.last().unwrap() <= 9000 && *xs.last().unwrap() > 8900, "{xs:?}");
+        // Short cells get the minimum width.
+        let out = r("| a | b |\n|---|---|\n");
+        assert!(body(&out).contains("\\cellx900") && body(&out).contains("\\cellx1800"));
+    }
+
+    #[test]
+    fn table_cell_budget_truncates_rows() {
+        let table = |rows: usize| {
+            let mut t = "|a".repeat(60) + "|\n" + &"|-".repeat(60) + "|\n";
+            t.push_str(&format!("{}|\n", "|x".repeat(60)).repeat(rows));
+            t
+        };
+        let budget_rows = TABLE_CELL_BUDGET / 60;
+        let md = format!("{}\nbetween\n\n{}", table(budget_rows + 100), table(1));
+        let out = r(&md);
+        let b = body(&out);
+        assert_eq!(b.matches("\\row\n").count(), budget_rows);
+        let first = format!("\\u8230? table truncated: showing {budget_rows} of {} rows", budget_rows + 101);
+        assert!(b.contains(&first), "first table message");
+        // The second table gets nothing — the budget is per document.
+        assert!(b.contains("\\u8230? table truncated: showing 0 of 2 rows"), "second table message");
+        assert!(b.contains("between"));
+        check_safe(&out, "table budget");
+    }
+
+    #[test]
+    fn table_cell_closes_open_html_groups_and_indents_in_lists() {
+        let out = r("| <b>x | <i>y</i> |\n|---|---|\n| z | w |\n");
+        let head = line_with(body(&out), "x}");
+        assert!(head.contains("{\\b x}\\cell") && head.contains("{\\i y}\\cell"), "{head}");
+        check_safe(&out, "html in cells");
+        let out = r("- item\n\n  | a |\n  |---|\n  | b |\n");
+        assert!(body(&out).contains("\\trowd\\trgaph110\\trleft380"), "{}", body(&out));
+        check_safe(&out, "table in list");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // HTML subset
+
+    #[test]
+    fn html_inline_formatting() {
+        let code = format!("{{\\f1\\fs19\\cf{C_CODEFG}{INLINE_PAD}x{INLINE_PAD}}}");
+        let mark = format!("{{\\highlight{C_THEAD} x}}");
+        let cases: Vec<(&str, String)> = vec![
+            ("b", "{\\b x}".into()),
+            ("strong", "{\\b x}".into()),
+            ("i", "{\\i x}".into()),
+            ("em", "{\\i x}".into()),
+            ("cite", "{\\i x}".into()),
+            ("var", "{\\i x}".into()),
+            ("u", "{\\ul x}".into()),
+            ("ins", "{\\ul x}".into()),
+            ("s", "{\\strike x}".into()),
+            ("strike", "{\\strike x}".into()),
+            ("del", "{\\strike x}".into()),
+            ("sub", "{\\sub x}".into()),
+            ("sup", "{\\super x}".into()),
+            ("mark", mark),
+            ("code", code.clone()),
+            ("kbd", code.clone()),
+            ("samp", code.clone()),
+            ("tt", code),
+        ];
+        for (tag, want) in cases {
+            let out = r(&format!("a <{tag}>x</{tag}> b"));
+            assert!(body(&out).contains(&format!("a {want} b")), "<{tag}>: {}", body(&out));
+            // Upper-case tags and attributes work the same.
+            let out = r(&format!("a <{} class=\"k\">x</{}> b", tag.to_uppercase(), tag.to_uppercase()));
+            assert!(body(&out).contains(&format!("a {want} b")), "<{tag}> upper: {}", body(&out));
+            check_safe(&out, tag);
+        }
+        // A closing tag closes its alias; unknown tags are ignored, their text is kept.
+        assert!(body(&r("<strong>x</b> y")).contains("{\\b x} y"));
+        assert!(body(&r("<em>x</i> y")).contains("{\\i x} y"));
+        assert!(body(&r("<del>x</s> y")).contains("{\\strike x} y"));
+        assert!(body(&r("<ins>x</u> y")).contains("{\\ul x} y"));
+        let out = r("<span class=\"x\" onclick=\"alert(1)\">t</span> <b onmouseover=\"alert(2)\">u</b>");
+        assert!(body(&out).contains(" t {\\b u}"), "{}", body(&out));
+        assert!(!out.rtf.contains("alert"));
+        check_safe(&out, "unknown tags");
+    }
+
+    #[test]
+    fn html_groups_close_at_paragraph_end_and_depth_is_capped() {
+        let out = r("a <b>x\n\ny");
+        let b = body(&out);
+        assert!(b.contains("a {\\b x}\\par") && line_with(b, "y\\par").ends_with(" y\\par"), "{b}");
+        let out = r(&format!("{}x{}", "<b>".repeat(100), "</b>".repeat(100)));
+        assert_eq!(body(&out).matches("{\\b ").count(), MAX_GROUP_DEPTH);
+        check_safe(&out, "deep html");
+        let out = r(&format!("{}x{}", "<i>".repeat(MAX_HTML_GROUPS + 50), "</i>".repeat(MAX_HTML_GROUPS + 50)));
+        let (_, _, max) = depth_stats(&out.rtf);
+        assert!(max <= MAX_GROUP_DEPTH as i64 + 4, "depth {max}");
+        check_safe(&out, "html group limit");
+        let out = r(&format!("{}x", "*a ".repeat(200)));
+        let (_, _, max) = depth_stats(&out.rtf);
+        assert!(max <= MAX_GROUP_DEPTH as i64 + 4, "depth {max}");
+        check_safe(&out, "emphasis depth");
+    }
+
+    #[test]
+    fn html_blocks_alignment() {
+        let out = r("<p align=\"right\">r</p>\n\n<p align=\"left\">l</p>\n\n<center>c</center>\n\n<div align=\"CENTER\">d</div>\n\nplain\n");
+        let b = body(&out);
+        for (al, text) in [("\\qr", "r"), ("\\ql", "l"), ("\\qc", "c"), ("\\qc", "d"), ("\\ql", "plain")] {
+            let line = line_with(b, &format!(" {text}\\par"));
+            assert!(line.starts_with(&format!("\\pard\\plain{al}")), "{text}: {line}");
+        }
+        // Nested blocks restore the outer alignment.
+        let out = r("<div align=\"center\">\n\n<p align=\"left\">l</p>\n\nc\n\n</div>\n\nafter\n");
+        let b = body(&out);
+        assert!(line_with(b, " l\\par").starts_with("\\pard\\plain\\ql"), "{b}");
+        assert!(line_with(b, " c\\par").starts_with("\\pard\\plain\\qc"), "{b}");
+        assert!(line_with(b, " after\\par").starts_with("\\pard\\plain\\ql"), "{b}");
+        check_safe(&out, "align");
+    }
+
+    #[test]
+    fn html_headings_and_structure() {
+        let out = r("<h1 align=\"center\">T</h1>\n<h3>U</h3>\n<h2 align=\"right\">V</h2>\n\nafter\n");
+        let b = body(&out);
+        let t = line_with(b, "\\b T");
+        assert!(t.contains("\\qc") && t.contains("\\fs46") && t.ends_with("\\cell\\row"), "{t}");
+        let u = line_with(b, "\\b U");
+        assert!(u.contains("\\ql") && u.contains("\\fs30") && u.ends_with("\\par"), "{u}");
+        let v = line_with(b, "\\b V");
+        assert!(v.contains("\\qr") && v.contains("\\fs36"), "{v}");
+        assert!(line_with(b, "after").contains("\\ql") && line_with(b, "after").contains("\\fs23"), "{b}");
+        check_safe(&out, "html headings");
+        // <br>, <li>, <td>, <details>/<summary>.
+        let out = r("a<br>b<br/>c");
+        assert!(body(&out).contains("a\\line b\\line c"), "{}", body(&out));
+        let out = r("<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n");
+        let b = body(&out);
+        assert!(b.contains(&format!("{{\\cf{C_MUTED} \\u8226?}} one\\par")) && b.contains(&format!("{{\\cf{C_MUTED} \\u8226?}} two\\par")), "{b}");
+        let out = r("<table><tr><td>a</td><td>b</td></tr></table>\n");
+        assert!(body(&out).contains(&format!("\\cf{C_FG}  a b\\par")), "{}", body(&out));
+        let out = r("<details>\n<summary>Sum {x}</summary>\n\nBody\n\n</details>\n");
+        let b = body(&out);
+        assert!(b.contains("{\\b \\u9656? Sum \\{x\\}}\\par"), "{b}");
+        assert!(b.contains(" Body\\par"), "{b}");
+        check_safe(&out, "details");
+    }
+
+    #[test]
+    fn html_anchors_and_links() {
+        let out = r("<a name=\"top\"></a>\n\n<div id=\"sec-1\">x</div>\n\n<a id=\"\">y</a> <b id=\"\">w</b> <span id=\"s\">z</span>\n");
+        assert_eq!(out.anchors, ["top", "sec-1", "s"]);
+        assert!(out.links.is_empty());
+        check_safe(&out, "html anchors");
+        let out = r("<a href=\"https://a.example\">t</a> and [md <a href=\"https://b.example\">inner</a>](https://c.example) <a title=\"x\">no href</a>");
+        let urls: Vec<(&str, &str)> = out.links.iter().map(|l| (l.url.as_str(), l.text.as_str())).collect();
+        assert_eq!(urls, [("https://a.example", "t"), ("https://c.example", "md inner")]);
+        assert!(body(&out).contains("no href"));
+        check_safe(&out, "html links");
+        let out = r("<a href=\"javascript:alert(1)\">j</a>");
+        assert!(body(&out).contains(&format!("{{\\cf{C_WARN}\\uld j}}")), "{}", body(&out));
+        check_safe(&out, "html js link");
+        // An unclosed <a href> ends with its paragraph.
+        let out = r("<a href=\"https://e.example\">first\n\nsecond");
+        assert_eq!(out.links.len(), 1);
+        assert_eq!(out.links[0].text, "first");
+        let b = body(&out);
+        assert!(b.find(&m(LINK_END)).unwrap() < b.find("second").unwrap());
+        check_safe(&out, "unclosed a");
+    }
+
+    #[test]
+    fn html_images() {
+        let out = r("<img src=\"a&amp;b.png\" width=\"120px\" height=\" 80 \" alt=\"Logo {x}\" onerror=\"alert(1)\"> <img alt=\"nosrc\"> <img src=\"c.png\" width=\"50%\">");
+        assert_eq!(out.images.len(), 2);
+        assert_eq!((out.images[0].src.as_str(), out.images[0].width, out.images[0].height), ("a&b.png", Some(120), Some(80)));
+        assert_eq!((out.images[1].src.as_str(), out.images[1].width, out.images[1].height), ("c.png", None, None));
+        let b = body(&out);
+        assert!(b.contains(" Logo \\{x\\}]"), "{b}");
+        assert!(b.contains(&format!("{{\\cf{C_MUTED} [nosrc]}}")), "{b}");
+        assert!(!out.rtf.contains("alert"));
+        check_safe(&out, "html images");
+    }
+
+    #[test]
+    fn html_hidden_containers() {
+        for tag in [
+            "script", "style", "iframe", "object", "embed", "template", "noscript", "svg", "math", "canvas", "video", "audio", "head", "title",
+            "frameset", "frame", "applet", "textarea", "form",
+        ] {
+            assert!(html::is_skipped_container(tag), "{tag}");
+            let out = r(&format!("before <{tag} a=\"1\">SECRET <b>x</b></{tag}> after"));
+            let b = body(&out);
+            assert!(!b.contains("SECRET") && b.contains("before") && b.contains(" after\\par"), "<{tag}>: {b}");
+            check_safe(&out, tag);
+            // As an HTML block.
+            let out = r(&format!("<{tag}>\nSECRET\n</{tag}>\n\nafter\n"));
+            assert!(!out.rtf.contains("SECRET") && out.rtf.contains("after"), "<{tag}> block: {}", body(&out));
+        }
+        // Nested same-name tags are counted.
+        let out = r("<svg><svg></svg>HIDDEN</svg>shown");
+        assert!(!out.rtf.contains("HIDDEN") && out.rtf.contains("shown"), "{}", body(&out));
+        // A self-closing tag hides nothing.
+        let out = r("<iframe src=\"https://e.example\"/> visible");
+        assert!(out.rtf.contains("visible"));
+        // <script> hides across blocks until it is closed: headings, links and images inside are not collected.
+        let out = r("a <script>\n\n# Hidden heading\n\n[l](https://e.example) ![i](i.png)\n\nhidden para </script> shown\n\nnext\n");
+        let b = body(&out);
+        assert!(!b.contains("Hidden") && !b.contains("hidden para") && b.contains("shown") && b.contains("next"), "{b}");
+        assert!(out.anchors.is_empty() && out.links.is_empty() && out.images.is_empty());
+        check_safe(&out, "script across blocks");
+        // Unclosed at the end of the document: the content stays hidden, the RTF stays valid.
+        for tag in ["iframe", "template", "script"] {
+            let out = r(&format!("a <{tag}> SECRET"));
+            assert!(!out.rtf.contains("SECRET") && body(&out).contains(" a \\par"), "<{tag}>: {}", body(&out));
+            check_safe(&out, tag);
+        }
+        // Comments are not shown (inline, multi-line inline, one-line block).
+        let out = r("a <!-- SECRET --> b <!--\nSECRET\n--> c\n\n<!-- SECRET -->\n\nd\n");
+        assert!(body(&out).contains("a  b  c\\par") && body(&out).contains(" d\\par"), "{}", body(&out));
+        assert!(!out.rtf.contains("SECRET"));
+        check_safe(&out, "comments");
+    }
+
+    #[test]
+    fn html_entities_are_decoded_then_escaped() {
+        // An HTML block: decoded by html::decode_entities (once — `&amp;amp;` stays `&amp;`).
+        let out = r("<div>\n<b>&lt;tag&gt; &amp;amp; &copy; &#x41;&#66; {&#x7B;} &#xE000; &#xF8FE; &#x202F;</b>\n</div>\n");
+        let b = body(&out);
+        // U+202F is whitespace in HTML text and collapses to a plain space.
+        assert!(b.contains(&format!("{{\\b <tag> &amp; {} AB \\{{\\{{\\}} \\u-3? \\u-3? }}", e("©"))), "{b}");
+        check_safe(&out, "entities");
+        // The same through Markdown's own entity decoding.
+        let out = r("&#xE000; &#xF8FE; &#xEC00; &#x202F; &#123;");
+        assert!(body(&out).contains("\\u-3? \\u-3? \\u-3? \\u8201? \\{"), "{}", body(&out));
+        check_safe(&out, "md entities");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Chunks and size limits
+
+    #[test]
+    fn single_chunk_document() {
+        let out = r("# Title\n\ntext\n");
+        assert_eq!(out.chunk_count(), 1);
+        assert_eq!(out.splits, [(out.body_start, 0)]);
+        assert_eq!(&out.rtf[out.body_end()..], "}\n");
+        // Loaded first: the whole document. Inserted later: without the final tiny paragraph.
+        assert_eq!(out.chunk_rtf(0, true), out.rtf.trim_end());
+        let later = out.chunk_rtf(0, false);
+        assert_eq!(format!("{}{CHUNK_TAIL}}}", &later[..later.len() - 1]), out.rtf.trim_end());
+        assert_balanced(&later, "chunk");
+        assert_eq!(chunk_append_pos(-5), 0);
+        assert_eq!(chunk_append_pos(0), 0);
+        assert_eq!(chunk_append_pos(17), 17);
+    }
+
+    #[test]
+    fn chunks_split_at_safe_paragraph_boundaries() {
+        let md: String = (0..4000).map(|i| format!("Paragraph {i} with *some* `text` {{x}}.\n\n")).collect();
+        // As in the app: padding above and empty space below the document.
+        let t = Theme::light();
+        let mut o = RenderOpts::new(&t, 9000);
+        o.top_pad_twips = 240;
+        o.tail_twips = 3000;
+        let out = render(&md, &o);
+        let n = out.chunk_count();
+        assert!(n >= 4, "chunks: {n}");
+        assert_eq!(out.splits[0], (out.body_start, 0));
+        for w in out.splits.windows(2) {
+            assert!(w[1].0 > w[0].0 && w[1].1 > w[0].1, "{w:?}");
+            assert!(w[1].0 - w[0].0 >= CHUNK_BYTES, "chunk too small: {w:?}");
+        }
+        let header = &out.rtf[..out.body_start];
+        let mut joined = String::new();
+        for (i, &(off, src)) in out.splits.iter().enumerate() {
+            if i > 0 {
+                assert!(out.rtf[..off].ends_with("\\par\n") && out.rtf[off..].starts_with("\\pard"), "split {i}");
+                assert!(md[src..].starts_with("Paragraph "), "split {i} source offset {src}");
+            }
+            for first in [true, false] {
+                let c = out.chunk_rtf(i, first);
+                assert!(c.starts_with(header) && c.ends_with('}'), "chunk {i}");
+                assert_balanced(&c, &format!("chunk {i} first={first}"));
+                // A chunk loaded first ends with the tiny paragraph RichEdit "eats" (appended,
+                // or the document's own for the last chunk); inserted chunks never do.
+                assert_eq!(c.ends_with(&format!("{CHUNK_TAIL}}}")), first, "chunk {i} first={first}");
+            }
+            let c = out.chunk_rtf(i, false);
+            joined.push_str(&c[out.body_start..c.len() - 1]);
+        }
+        // The chunks inserted one by one form the whole body (minus the eaten tail paragraph).
+        let whole = &out.rtf[out.body_start..out.body_end()];
+        assert_eq!(joined, whole.strip_suffix(CHUNK_TAIL).unwrap());
+    }
+
+    #[test]
+    fn no_split_inside_quotes_tables_or_code() {
+        let paras: String = (0..1500).map(|i| format!("Paragraph {i} text text text.\n\n")).collect();
+        let quote: String = (0..1500).map(|i| format!("> quote paragraph {i}\n>\n")).collect();
+        let mut table = String::from("| a | b |\n|---|---|\n");
+        table.push_str(&(0..1200).map(|i| format!("| cell {i} | {i} |\n")).collect::<String>());
+        let code = format!("```\n{}```\n", "let x = 1;\n".repeat(6000));
+        let md = format!("{paras}{quote}\n{paras}{table}\n{paras}{code}\n{paras}");
+        let out = r(&md);
+        let range = |part: &str| {
+            let a = md.find(part).unwrap();
+            (a, a + part.len())
+        };
+        for (name, (a, b)) in [("quote", range(&quote)), ("table", range(&table)), ("code", range(&code))] {
+            for &(_, src) in &out.splits {
+                assert!(src <= a || src >= b, "split at {src} inside the {name} ({a}..{b})");
+            }
+            assert!(out.splits.iter().any(|&(_, s)| s >= b), "no split after the {name}");
+        }
+        for i in 0..out.chunk_count() {
+            assert_balanced(&out.chunk_rtf(i, true), "chunk");
+        }
+    }
+
+    #[test]
+    fn huge_documents_are_truncated_with_a_notice() {
+        // An empty heading costs ~200 bytes of RTF for 2 bytes of source.
+        let md = format!("{}TAILMARKER\n", "#\n".repeat(MAX_RTF_BYTES / 150));
+        let out = r(&md);
+        assert!(out.rtf.len() > MAX_RTF_BYTES && out.rtf.len() < MAX_RTF_BYTES + 64 * 1024, "{} bytes", out.rtf.len());
+        assert!(out.rtf.contains("The document is too large for formatted view"));
+        assert!(!out.rtf.contains("TAILMARKER"));
+        assert_balanced(&out.rtf, "truncated");
+        assert!(out.rtf.ends_with("\\pard\\plain\\sb0\\sa0\\fs2\\par\n}\n"));
+        assert_eq!(out.anchors.len(), MAX_ANCHORS);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Regression tests for fixed rendering bugs
+
+    /// HTML blocks arrive line by line: a comment or a tag spanning lines is parsed as a whole.
+    #[test]
+    fn multi_line_html_in_blocks() {
+        let out = r("<!--\nSECRET\n-->\n\nafter\n");
+        let b = body(&out);
+        assert!(!b.contains("SECRET") && !b.contains("-->") && b.contains(" after\\par"), "{b}");
+        let out = r("<div>\n<!--\nSECRET\n-->\nshown\n</div>\n");
+        let b = body(&out);
+        assert!(!b.contains("SECRET") && !b.contains("-->") && b.contains("shown"), "{b}");
+        let out = r("<p align=\"center\">\n  <img src=\"a.png\"\n       width=\"64\"\n       alt=\"Logo\">\n</p>\n");
+        assert_eq!(out.images.len(), 1);
+        assert_eq!((out.images[0].src.as_str(), out.images[0].width), ("a.png", Some(64)));
+        assert!(!body(&out).contains("<img") && body(&out).contains(" Logo]"), "{}", body(&out));
+        check_safe(&out, "split tag");
+        let out = r("<script>\nlet a = 1;\n\n</script>\n\nok\n");
+        assert!(!out.rtf.contains("let a") && out.rtf.contains("ok"));
+    }
+
+    #[test]
+    fn unclosed_hiding_tags_end_at_the_block() {
+        for tag in ["iframe", "template", "svg", "video", "object", "form"] {
+            let out = r(&format!("a <{tag}> hidden\n\nshown\n\n# Heading\n"));
+            let b = body(&out);
+            assert!(!b.contains("hidden") && b.contains(" shown\\par"), "<{tag}>: {b}");
+            assert_eq!(out.anchors, ["heading"], "<{tag}>");
+            check_safe(&out, tag);
+            let out = r(&format!("<{tag}>\nhidden\n\nshown\n"));
+            assert!(!out.rtf.contains("hidden") && out.rtf.contains("shown"), "<{tag}> block: {}", body(&out));
+            // In a table cell: up to the end of the cell; the table itself is shown.
+            let out = r(&format!("| a <{tag}> hidden | b |\n|---|---|\n| c | d |\n\nafter\n"));
+            let b = body(&out);
+            assert!(!b.contains("hidden") && b.contains(" b\\cell") && b.contains(" d\\cell") && b.contains("after"), "<{tag}> cell: {b}");
+            check_safe(&out, tag);
+        }
+        // <script>, <style>, <textarea> keep hiding until their closing tag.
+        let out = r("a <style>\n\nhidden\n\n</style> shown\n");
+        assert!(!out.rtf.contains("hidden") && out.rtf.contains("shown"));
+    }
+
+    #[test]
+    fn form_content_is_hidden() {
+        let out = r("a <form action=\"https://e.example\"><input value=\"x\">Login <button>Go</button></form> b\n\n<form>\n<label>Password</label>\n</form>\n\nafter\n");
+        let b = body(&out);
+        assert!(!b.contains("Login") && !b.contains("Go") && !b.contains("Password"), "{b}");
+        assert!(b.contains("a  b\\par") && b.contains("after"), "{b}");
+        check_safe(&out, "form");
+    }
+
+    #[test]
+    fn block_html_and_formulas_in_table_cells_stay_in_the_cell() {
+        let out = r("| x <li>item | y <hr> z | $$m+n$$ |\n|---|---|---|\n");
+        let b = body(&out);
+        let before = &b[..b.find("\\trowd").unwrap()];
+        assert!(!before.contains("\\u8226?") && !before.contains("\\clbrdrt") && !before.contains("\\cell"), "{before}");
+        let row = line_with(b, "item");
+        assert!(row.contains(&format!("x {{\\cf{C_MUTED} \\u8226?}} item\\cell")), "{row}");
+        assert!(row.contains("y \\line  z\\cell"), "{row}");
+        assert!(row.contains(&format!("{{\\f1\\fs20\\i\\cf{C_ACCENT} m+n}}\\cell")), "{row}");
+        assert!(!b.contains("formula"), "{b}");
+        check_safe(&out, "cells");
+        // Math inside alt text is alt text.
+        let out = r("![a $x$ b](i.png)");
+        assert!(body(&out).contains(" a x b]") && !body(&out).contains(&format!("\\i\\cf{C_ACCENT}")), "{}", body(&out));
+    }
+
+    /// The size limit hit while a table is being assembled: the table is dropped together with
+    /// the groups, links, images and anchors in it — the RTF stays balanced, markers match.
+    #[test]
+    fn truncation_inside_a_table_keeps_the_rtf_valid() {
+        let t = Theme::light();
+        let opts = RenderOpts::new(&t, 9000);
+        let head = "# Title\n\nbefore [l](https://a.example)\n\n";
+        let mut md = format!("{head}| a | b |\n|---|---|\n");
+        for i in 0..400 {
+            md.push_str(&format!(
+                "| `c{i}` [x](https://b.example) ![i](i{i}.png) <a name=\"n{i}\"></a> | <b>open <a href=\"https://c.example\">link <i>it {i} |\n"
+            ));
+        }
+        md.push_str("\nTAIL\n");
+        let limit = render(head, &opts).rtf.len() + 30_000;
+        let out = render_limited(&md, &opts, limit);
+        let b = body(&out);
+        assert!(out.rtf.contains("The document is too large for formatted view"));
+        assert!(b.contains("before") && !b.contains("TAIL") && !b.contains("\\trgaph110"), "the table must be cut off");
+        let urls: Vec<&str> = out.links.iter().map(|l| l.url.as_str()).collect();
+        assert_eq!(urls, ["https://a.example"]);
+        assert!(out.images.is_empty());
+        assert_eq!(out.anchors, ["title"]);
+        check_safe(&out, "truncated table");
+        // Without the limit the same document is complete.
+        let full = render(&md, &opts);
+        assert!(full.rtf.contains("TAIL") && full.images.len() == 400);
+        check_safe(&full, "full table");
+    }
+
+    /// Cut off inside a link: the link still gets its end marker.
+    #[test]
+    fn truncation_inside_a_link_closes_it() {
+        let t = Theme::light();
+        let opts = RenderOpts::new(&t, 9000);
+        let md = format!("intro\n\n[{}](https://a.example) tail\n", "word ".repeat(5000));
+        let limit = render("intro\n", &opts).rtf.len() + 1000;
+        let out = render_limited(&md, &opts, limit);
+        assert!(out.rtf.contains("The document is too large for formatted view"));
+        assert!(!out.rtf.contains("tail"));
+        assert_eq!(out.links.len(), 1);
+        check_safe(&out, "truncated link");
+    }
+
+    #[test]
+    fn unclosed_html_link_ends_with_its_table_cell() {
+        let out = r("| <a href=\"https://e.example\">x | y |\n|---|---|\n| z | w |\n\nafter\n");
+        assert_eq!(out.links.len(), 1);
+        assert_eq!(out.links[0].text, "x");
+        let b = body(&out);
+        assert!(line_with(b, &m(LINK_END)).contains(&format!("x}}{{\\v{}}}\\cell", m(LINK_END))), "{b}");
+        assert!(line_with(b, "after").contains(&format!("\\cf{C_FG} after\\par")), "{b}");
+        check_safe(&out, "cell link");
+        // The table ends the document.
+        let out = r("| <a href=\"https://e.example\">x | y |\n|---|---|\n");
+        assert_eq!(out.links[0].text, "x");
+        check_safe(&out, "cell link at the end");
+    }
+
+    #[test]
+    fn email_autolinks_get_mailto() {
+        let out = r("Write to <me@mail.example>.");
+        assert_eq!(out.links.len(), 1);
+        assert_eq!(out.links[0].url, "mailto:me@mail.example");
+        assert_eq!(out.links[0].text, "me@mail.example");
+        assert!(matches!(crate::links::classify(&out.links[0].url, None), crate::links::LinkAction::Mail(_)));
+        assert!(body(&out).contains(&format!("{{\\cf{C_LINK}\\ul me@mail.example}}")), "{}", body(&out));
+        check_safe(&out, "email");
+        // A URI autolink with a scheme is left as is.
+        let out = r("<mailto:a@b.example> <https://c.example>");
+        let urls: Vec<&str> = out.links.iter().map(|l| l.url.as_str()).collect();
+        assert_eq!(urls, ["mailto:a@b.example", "https://c.example"]);
+    }
+
+    #[test]
+    fn unclosed_paragraph_alignment_ends_with_the_block() {
+        let out = r("text <p align=\"center\"> more\n\nnext para\n");
+        let b = body(&out);
+        assert!(line_with(b, " more\\par").starts_with("\\pard\\plain\\qc"), "{b}");
+        assert!(line_with(b, "next para").starts_with("\\pard\\plain\\ql"), "{b}");
+        let out = r("<p align=\"right\">\nx\n\nnext\n\n<h2 align=\"center\">H\n\nafter\n");
+        let b = body(&out);
+        assert!(line_with(b, " x \\par").starts_with("\\pard\\plain\\qr"), "{b}");
+        assert!(line_with(b, " next\\par").starts_with("\\pard\\plain\\ql"), "{b}");
+        assert!(line_with(b, "\\b H").contains("\\intbl\\qc"), "{b}");
+        assert!(line_with(b, " after\\par").starts_with("\\pard\\plain\\ql"), "{b}");
+        // </p> does not end the alignment of the enclosing <div>; the div's lasts until </div>.
+        let out = r("<div align=\"center\">\n\n<p align=\"right\">x\n\ny</p>\n\nz\n\n</div>\n\nw\n");
+        let b = body(&out);
+        for (text, al) in [("x", "\\qr"), ("y", "\\qc"), ("z", "\\qc"), ("w", "\\ql")] {
+            assert!(line_with(b, &format!("\\cf{C_FG} {text}")).starts_with(&format!("\\pard\\plain{al}")), "{text}: {b}");
+        }
+        check_safe(&out, "align");
+    }
+
+    /// A `code` pill is a pair of INLINE_PAD: closed by an alias, at the paragraph end or in a cell.
+    #[test]
+    fn html_code_pills_always_get_both_paddings() {
+        for (md, pads) in [
+            ("a <kbd>x</code> b", 2),
+            ("a <code>x</kbd> b", 2),
+            ("a <code>x\n\nb", 2),
+            ("| <code>x</code> | <kbd>y |\n|---|---|\n", 4),
+            ("a <samp><b>x</samp> b", 2),
+        ] {
+            let out = r(md);
+            assert_eq!(out.rtf.matches(INLINE_PAD).count(), pads, "{md:?}: {}", body(&out));
+            check_safe(&out, md);
+        }
+    }
+
+    #[test]
+    fn less_than_before_a_digit_is_text_in_html() {
+        let out = r("<div>\nif a <3 and b> 2\n</div>\n");
+        assert!(body(&out).contains("if a <3 and b> 2"), "{}", body(&out));
+    }
+
+    #[test]
+    fn loose_task_lists_have_no_bullet() {
+        let out = r("- [ ] a\n\n- [x] b\n\n- plain\n");
+        let b = body(&out);
+        assert!(line_with(b, "\\tab a\\par").contains(&format!("\\cf{C_FG} {{\\f2\\cf{C_ACCENT} \\u9744?}}\\tab a\\par")), "{b}");
+        assert!(line_with(b, "\\tab b\\par").contains(&format!("\\cf{C_FG} {{\\f2\\cf{C_ACCENT} \\u9745?}}\\tab b\\par")), "{b}");
+        // An ordinary item of the same list keeps its bullet.
+        assert!(line_with(b, "\\tab plain").contains("\\u8226?"), "{b}");
+        check_safe(&out, "loose tasks");
     }
 }

@@ -287,14 +287,35 @@ impl Styler {
             let _ = doc.Undo(tomSuspend.0);
             let _ = doc.Freeze();
         }
+        let mut applied: Vec<(i32, i32)> = Vec::new();
         for r in &a.runs {
             if keep_runs.contains(r) {
                 continue;
             }
+            applied.push((r.start as i32, r.end as i32));
             if let Some(f) = self.font(visual, r.flags) {
                 unsafe {
                     let _ = range.SetRange(r.start as i32, (r.end as i32).min(total + 1));
                     let _ = range.SetFont(&f);
+                }
+            }
+        }
+        // Emoji and pictographic symbols get their own fonts on top of the run fonts: RichEdit's
+        // fallback finds no glyph for many of them (□). Only inside re-applied runs: elsewhere
+        // the characters keep the font they got before. (Emoji stay monochrome here — the color
+        // overlay is the view's, emoji.rs.)
+        applied.sort_unstable();
+        let mut k = 0;
+        for (s, e, emoji) in crate::render::symbol_clusters(&text16) {
+            while k < applied.len() && applied[k].1 <= s {
+                k += 1;
+            }
+            if k < applied.len() && applied[k].0 < e {
+                unsafe {
+                    let _ = range.SetRange(s, e);
+                    if let Ok(f) = range.GetFont() {
+                        let _ = f.SetName(&BSTR::from(if emoji { "Segoe UI Emoji" } else { "Segoe UI Symbol" }));
+                    }
                 }
             }
         }
@@ -342,4 +363,293 @@ fn syn_color(t: &Theme, flags: u32) -> Option<u32> {
 fn is_syn_comment(flags: u32) -> bool {
     flags & fl::CODEBLOCK != 0
         && crate::highlight::Kind::from_code((flags & fl::SYN_MASK) >> fl::SYN_SHIFT) == crate::highlight::Kind::Comment
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::richedit::tests::Host;
+    use crate::testutil::richedit_lock;
+
+    /// Character formatting at one position, read back through TOM.
+    #[derive(Debug, PartialEq, Clone)]
+    struct F {
+        hidden: bool,
+        bold: bool,
+        italic: bool,
+        strike: bool,
+        under: bool,
+        size10: i32,
+        name: String,
+        fore: u32,
+        back: Option<u32>,
+    }
+
+    fn font(doc: &ITextDocument, cp: i32) -> F {
+        unsafe {
+            let f = doc.Range(cp, cp + 1).unwrap().GetFont().unwrap();
+            let back = f.GetBackColor().unwrap();
+            F {
+                hidden: f.GetHidden().unwrap() == TOM_TRUE,
+                bold: f.GetBold().unwrap() == TOM_TRUE,
+                italic: f.GetItalic().unwrap() == TOM_TRUE,
+                strike: f.GetStrikeThrough().unwrap() == TOM_TRUE,
+                under: f.GetUnderline().unwrap() != 0,
+                size10: (f.GetSize().unwrap() * 10.0).round() as i32,
+                name: f.GetName().unwrap().to_string(),
+                fore: f.GetForeColor().unwrap() as u32,
+                back: if back == TOM_AUTOCOLOR { None } else { Some(back as u32) },
+            }
+        }
+    }
+
+    /// Paragraph formatting of the paragraph containing `cp`.
+    #[derive(Debug, PartialEq, Clone)]
+    struct P {
+        list: i32,
+        left10: i32,
+        first10: i32,
+        before10: i32,
+        rule: i32,
+    }
+
+    fn para(doc: &ITextDocument, cp: i32) -> P {
+        unsafe {
+            let p = doc.Range(cp, cp).unwrap().GetPara().unwrap();
+            P {
+                list: p.GetListType().unwrap(),
+                left10: (p.GetLeftIndent().unwrap() * 10.0).round() as i32,
+                first10: (p.GetFirstLineIndent().unwrap() * 10.0).round() as i32,
+                before10: (p.GetSpaceBefore().unwrap() * 10.0).round() as i32,
+                rule: p.GetLineSpacingRule().unwrap(),
+            }
+        }
+    }
+
+    /// UTF-16 position of the first `needle` in `t` (line breaks are one position, like '\r').
+    fn pos(t: &str, needle: &str) -> i32 {
+        let i = t.find(needle).unwrap_or_else(|| panic!("{needle:?}"));
+        t[..i].encode_utf16().count() as i32
+    }
+
+    const DOC: &str = "# Title\n\n**bold** *it* ~~s~~ `code` [link](http://x) ![img](a.png)\n\n```rust\nfn main() { let s: String = \"x\"; } // c\n```\n\n###### six\n> quote\n- item\n1. one\n$m$ <b>h</b> x[^1]\n\n[^1]: n\n\n---\n";
+
+    fn styled(t: &str, theme: Theme, visual: bool) -> (Host, Styler, ITextDocument) {
+        let h = Host::new(false, 700, 500);
+        richedit::set_plain_text(h.edit, t);
+        let mut st = Styler::new(h.edit, theme);
+        st.restyle(h.edit, visual, None);
+        let doc = richedit::tom(h.edit).unwrap();
+        (h, st, doc)
+    }
+
+    /// Emoji and symbols get their fonts in both modes, also in a heading and after an edit.
+    #[test]
+    fn emoji_and_symbol_fonts() {
+        let _g = richedit_lock();
+        let t = "# Plan 🟡\n\nok ✅ and ✔ x\n";
+        for visual in [true, false] {
+            let (h, mut st, doc) = styled(t, Theme::dark(), visual);
+            assert_eq!(font(&doc, pos(t, "🟡")).name, "Segoe UI Emoji", "visual={visual}");
+            assert_eq!(font(&doc, pos(t, "✅")).name, "Segoe UI Emoji", "visual={visual}");
+            assert_eq!(font(&doc, pos(t, "✔")).name, "Segoe UI Symbol", "visual={visual}");
+            assert_ne!(font(&doc, pos(t, "ok")).name, "Segoe UI Emoji");
+            // An edit in front: the incremental restyle keeps / re-applies the fonts.
+            let t2 = format!("x{t}");
+            richedit::set_plain_text(h.edit, &t2);
+            st.restyle(h.edit, visual, None);
+            assert_eq!(font(&doc, pos(&t2, "✅")).name, "Segoe UI Emoji", "visual={visual} after edit");
+        }
+    }
+
+    #[test]
+    fn visual_mode_fonts() {
+        let _g = richedit_lock();
+        let th = Theme::light();
+        let (h, st, doc) = styled(DOC, th, true);
+        assert_eq!(st.text(), richedit::get_text(h.edit).as_slice());
+        let f = |needle: &str| font(&doc, pos(DOC, needle));
+        // heading: the "# " marker is hidden, the text is large, bold, heading-colored
+        assert!(font(&doc, 0).hidden && font(&doc, 1).hidden);
+        let t = f("Title");
+        assert!(t.bold && !t.hidden && t.size10 == 240 && t.name == "Segoe UI" && t.fore == th.heading, "{t:?}");
+        // emphasis: markers hidden, text styled
+        assert!(f("**bold").hidden);
+        let b = f("bold**");
+        assert!(b.bold && !b.italic && b.fore == th.fg && b.size10 == 120 && b.back.is_none(), "{b:?}");
+        assert!(f("it*").italic && f("s~~").strike);
+        // inline code
+        assert!(f("`code").hidden);
+        let c = f("code`");
+        assert!(c.name == "Consolas" && c.size10 == 105 && c.fore == th.code_fg && c.back == Some(th.code_inline_bg), "{c:?}");
+        // link: underlined text, hidden address
+        let l = f("link]");
+        assert!(l.under && l.fore == th.link && !l.hidden, "{l:?}");
+        assert!(f("(http://x)").hidden && f("http://x").hidden);
+        // image alt text
+        let i = f("img]");
+        assert!(i.italic && i.fore == th.muted && i.back == Some(th.code_bg), "{i:?}");
+        // code block: the fence stays visible and small, the body is highlighted
+        let fence = f("```rust");
+        assert!(!fence.hidden && fence.size10 == 90 && fence.name == "Consolas" && fence.fore == th.muted && fence.back == Some(th.code_bg), "{fence:?}");
+        let kw = f("fn main");
+        assert!(kw.fore == th.syn_keyword && kw.back == Some(th.code_bg) && kw.size10 == 105 && !kw.italic, "{kw:?}");
+        let cm = f("// c");
+        assert!(cm.italic && cm.fore == th.syn_comment, "{cm:?}");
+        assert_eq!(f("String").fore, th.syn_type);
+        assert_eq!(f("\"x\"").fore, th.syn_string);
+        assert_eq!(f("main").fore, th.syn_func);
+        assert_eq!(f("s: String").fore, th.code_fg, "plain code keeps the code color");
+        // a level-6 heading is muted
+        let six = f("six");
+        assert!(six.bold && six.size10 == 120 && six.fore == th.muted, "{six:?}");
+        // quote, bullet marker hidden, ordered marker visible
+        assert!(f("> quote").hidden && f("quote").fore == th.quote);
+        assert!(f("- item").hidden && !f("item").hidden);
+        let one = f("1. one");
+        assert!(!one.hidden && one.fore == th.muted, "{one:?}");
+        // math, inline HTML, footnote, rule
+        let m = f("m$");
+        assert!(m.name == "Consolas" && m.fore == th.accent, "{m:?}");
+        let html = f("<b>");
+        assert!(!html.hidden && html.name == "Consolas" && html.fore == th.muted, "{html:?}");
+        assert_eq!(f("[^1]").fore, th.link);
+        assert_eq!(f("---").fore, th.muted);
+        // formatting is not recorded in the undo history
+        assert_eq!(crate::util::send(h.edit, windows::Win32::UI::Controls::EM_CANUNDO, 0, 0), 0);
+    }
+
+    #[test]
+    fn visual_mode_paragraphs() {
+        let _g = richedit_lock();
+        let (_h, _st, doc) = styled(DOC, Theme::light(), true);
+        let p = |needle: &str| para(&doc, pos(DOC, needle));
+        let h1 = p("# Title");
+        assert_eq!((h1.before10, h1.list, h1.rule), (120, 0, 5), "{h1:?}");
+        assert_eq!(p("###### six").before10, 60);
+        assert_eq!(p("> quote").left10, 140);
+        let item = p("- item");
+        assert_eq!((item.list, item.left10, item.first10), (1, 180, -120), "bullet list: {item:?}");
+        let one = p("1. one");
+        assert_eq!((one.list, one.left10), (0, 180), "ordered items keep their visible number: {one:?}");
+        let plain = p("$m$");
+        assert_eq!((plain.list, plain.left10, plain.before10, plain.rule), (0, 0, 0, 5));
+    }
+
+    #[test]
+    fn code_mode_and_caret_line() {
+        let _g = richedit_lock();
+        let th = Theme::light();
+        let (h, mut st, doc) = styled(DOC, th, false);
+        let f = |needle: &str| font(&doc, pos(DOC, needle));
+        // nothing is hidden, one monospace font
+        let hash = font(&doc, 0);
+        assert!(!hash.hidden && hash.bold && hash.name == "Consolas" && hash.size10 == 110 && hash.fore == th.muted, "{hash:?}");
+        let t = f("Title");
+        assert!(t.bold && t.fore == th.accent && t.size10 == 110, "{t:?}");
+        assert!(!f("**bold").hidden && f("bold**").bold);
+        let l = f("link]");
+        assert!(!l.under && l.fore == th.link, "{l:?}");
+        assert_eq!(f("img]").fore, th.warn);
+        assert_eq!(f("quote").fore, th.quote);
+        assert_eq!(f("code`").back, Some(th.code_inline_bg));
+        assert_eq!(f("fn main").fore, th.syn_keyword);
+        assert!(f("// c").italic);
+        assert_eq!(f("<b>").fore, th.muted);
+        assert_eq!(f("[^1]").fore, th.link);
+        assert_eq!(f("m$").fore, th.accent);
+        let item = para(&doc, pos(DOC, "- item"));
+        assert_eq!((item.list, item.left10, item.rule), (0, 0, 0), "{item:?}");
+        // visual mode with the caret on the heading line: its markers are revealed
+        st.restyle(h.edit, true, Some(0));
+        assert!(!font(&doc, 0).hidden && font(&doc, 0).name == "Segoe UI");
+        assert!(f("**bold").hidden, "other lines keep hidden markers");
+        // the caret moves away: hidden again
+        st.restyle(h.edit, true, Some(2));
+        assert!(font(&doc, 0).hidden);
+        // the same text, mode and caret: nothing to do
+        st.restyle(h.edit, true, Some(2));
+        assert!(font(&doc, 0).hidden);
+    }
+
+    #[test]
+    fn theme_switch_restyles_everything() {
+        let _g = richedit_lock();
+        let (h, mut st, doc) = styled(DOC, Theme::light(), true);
+        let dark = Theme::dark();
+        st.set_theme(dark);
+        assert!(st.text().is_empty(), "invalidated");
+        st.restyle(h.edit, true, None);
+        let b = font(&doc, pos(DOC, "bold**"));
+        assert_eq!(b.fore, dark.fg);
+        assert_eq!(font(&doc, pos(DOC, "Title")).fore, dark.heading);
+        assert_eq!(font(&doc, pos(DOC, "fn main")).back, Some(dark.code_bg));
+    }
+
+    /// After an edit only the changed runs are reapplied; the result must equal a full restyle.
+    #[test]
+    fn incremental_restyle_equals_full_restyle() {
+        let _g = richedit_lock();
+        let th = Theme::light();
+        let (a, mut st, doc_a) = styled(DOC, th, true);
+        // (selection to replace, new text) — in the middle, across constructs, at both ends,
+        // turning a paragraph into a heading, deleting a code fence
+        let edits: Vec<(&str, &str)> = vec![
+            ("bold", "BOLDER **x**"),
+            ("it* ~~s~~ `co", ""),
+            ("# Title", "Title"),
+            ("---\n", "---\nend `z`"),
+            ("$m$", "# $m$"),
+            ("```\n", ""),
+            ("Title", "Ünïcödé 😀 **b**"),
+        ];
+        for (old, new) in edits {
+            let cur = crate::richedit::tests::text(a.edit).replace('\r', "\n");
+            let s = pos(&cur, old);
+            richedit::set_sel(a.edit, s, s + old.encode_utf16().count() as i32);
+            richedit::replace_sel(a.edit, new, true);
+            st.restyle(a.edit, true, None);
+            let now = crate::richedit::tests::text(a.edit).replace('\r', "\n");
+            assert_eq!(now, cur.replacen(old, new, 1));
+            // reference: the same text styled from scratch in another control
+            let (b, _st_b, doc_b) = styled(&now, th, true);
+            let n = richedit::text_len(b.edit);
+            for cp in 0..n {
+                assert_eq!(font(&doc_a, cp), font(&doc_b, cp), "after {old:?} → {new:?}: char {cp} in {now:?}");
+            }
+            let mut cp = 0;
+            for line in now.split('\n') {
+                assert_eq!(para(&doc_a, cp), para(&doc_b, cp), "after {old:?} → {new:?}: line {line:?}");
+                cp += line.encode_utf16().count() as i32 + 1;
+            }
+        }
+    }
+
+    /// Without TOM (not a RichEdit) the styler does nothing and does not panic.
+    #[test]
+    fn no_tom_no_styling() {
+        let _g = richedit_lock();
+        let h = Host::new(false, 200, 100);
+        let edit_class = crate::util::wide("EDIT");
+        let edit = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::CreateWindowExW(
+                Default::default(),
+                windows::core::PCWSTR::from_raw(edit_class.as_ptr()),
+                windows::core::PCWSTR::null(),
+                windows::Win32::UI::WindowsAndMessaging::WS_CHILD,
+                0,
+                0,
+                10,
+                10,
+                Some(h.parent),
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        let mut st = Styler::new(edit, Theme::light());
+        st.restyle(edit, true, Some(0));
+        assert!(st.text().is_empty());
+    }
 }

@@ -107,3 +107,56 @@ pub fn get_y_lparam(lp: isize) -> i32 {
 pub fn exe_dir() -> Option<std::path::PathBuf> {
     std::env::current_exe().ok()?.parent().map(|p| p.to_path_buf())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_strings() {
+        assert_eq!(wide(""), [0]);
+        assert_eq!(wide("ab"), [0x61, 0x62, 0]);
+        assert_eq!(wide("я😀"), [0x44F, 0xD83D, 0xDE00, 0], "surrogate pair + NUL");
+        assert_eq!(wide_path(Path::new("C:\\Папка\\a.md")), wide("C:\\Папка\\a.md"));
+        // A path that is not valid Unicode (lone surrogate) is passed through unchanged.
+        use std::os::windows::ffi::OsStringExt;
+        let odd = std::ffi::OsString::from_wide(&[0xD800, 0x61]);
+        assert_eq!(wide_path(Path::new(&odd)), [0xD800, 0x61, 0]);
+        let w = wide("text");
+        let p = pcwstr(&w);
+        assert_eq!(p.as_ptr(), w.as_ptr());
+        assert_eq!(unsafe { p.to_string() }.unwrap(), "text");
+    }
+
+    #[test]
+    fn words_and_lparam_coordinates() {
+        assert_eq!(loword(0x1234_5678), 0x5678);
+        assert_eq!(hiword(0x1234_5678), 0x1234);
+        assert_eq!(loword(0xFFFF_FFFF_0001_0002), 0x0002, "high 32 bits are ignored");
+        assert_eq!(hiword(0xFFFF_FFFF_0001_0002), 0x0001);
+        // Coordinates are signed 16-bit (multi-monitor setups have negative ones).
+        let lp = |x: i16, y: i16| ((y as u16 as isize) << 16) | x as u16 as isize;
+        assert_eq!((get_x_lparam(lp(120, 45)), get_y_lparam(lp(120, 45))), (120, 45));
+        assert_eq!((get_x_lparam(lp(-10, -5)), get_y_lparam(lp(-10, -5))), (-10, -5));
+        assert_eq!((get_x_lparam(lp(i16::MIN, i16::MAX)), get_y_lparam(lp(i16::MIN, i16::MAX))), (-32768, 32767));
+    }
+
+    #[test]
+    fn clocks() {
+        // 2020-01-01 in FILETIME units.
+        const Y2020: u64 = 132_223_104_000_000_000;
+        let a = now_filetime();
+        let b = now_filetime();
+        assert!(a > Y2020 && b >= a);
+        let ms = ms_since_process_start();
+        assert!(ms >= 0.0 && ms < 24.0 * 3600.0 * 1000.0, "{ms}");
+        assert!(ms_since_process_start() >= ms);
+    }
+
+    #[test]
+    fn exe_dir_is_the_parent_of_the_exe() {
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(exe_dir().as_deref(), exe.parent());
+        assert_eq!(APP_NAME, "vibe-md-viewer");
+    }
+}

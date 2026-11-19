@@ -25,7 +25,7 @@ The `.ps1` scripts are saved as UTF-8 **with BOM** — otherwise Windows PowerSh
 ## Commands
 
 ```powershell
-# release → dist\vibe-md-viewer.exe (≈2.6 MB)
+# release → dist\vibe-md-viewer.exe (≈2.7 MB)
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 # the same + tests
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Test
@@ -68,6 +68,24 @@ Locally the same — `scripts\package.ps1` → `dist\`.
 
 Users update by running the new exe (see README, “Updating”). Versions are compared numerically `a.b.c`: an update is offered only if the new version is greater than the installed one.
 
+## Code coverage
+
+`scripts\coverage.ps1` builds the program with coverage counters (`-C instrument-coverage`, into `target\cov`), runs the unit tests, the live-window self-test and the service modes (`--profile` on a large document, snapshots, startup timing, the setup wizard window — nothing is installed), and prints line coverage per file; `-Html` also writes an HTML report to `.toolcache\coverage\html`, `-MinLines N` fails below N%.
+
+It needs `llvm-profdata.exe` and `llvm-cov.exe` of the same LLVM version as `rustc` (`rustc -vV`). In CI they come from the rustup component `llvm-tools`. Locally, so that nothing is installed on drive C:, they are put into `.toolcache\llvm-tools`: take `llvm-tools-<version>-x86_64-pc-windows-msvc.tar.xz` for your `rustc` version from the channel manifest `https://static.rust-lang.org/dist/channel-rust-<version>.toml` and extract only these two files.
+
+Current line coverage is **87.7%**. The core modules are at 96–100%: render, html, highlight, styler, editor, richedit, links, images, doc, settings, theme and emoji.
+
+What is not covered, and why:
+- modal windows and system dialogs (message boxes, file open/save, UAC): `dialogs.rs` is at 0%, the setup wizard at 56%;
+- installing into Program Files/HKLM with administrator rights (`install.rs` 72%);
+- real downloads from the internet;
+- failure branches of Win32 calls.
+
+Everything else is covered by unit tests or by the self-test. 100% is not reachable without a person clicking through UAC and dialogs.
+
+The CI job `coverage` runs the same script with `-MinLines 85` and shows the summary on the run page; the HTML report is an artifact.
+
 ## Command-line options
 
 | Option | Purpose |
@@ -102,7 +120,7 @@ Scrolling (`scripts\profile.ps1 -Size 2560x1380`, a 268 KB document): a frame ta
 
 What is already done for speed:
 
-- rarely used DLLs (WinHTTP, shell32, comdlg32, ole32, oleaut32) are delay-loaded (`/DELAYLOAD`, see `build.rs`);
+- rarely used DLLs (WinHTTP, shell32, comdlg32, ole32, oleaut32; d2d1 and dwrite for color emoji — only after the first paint of a document with emoji) are delay-loaded (`/DELAYLOAD`, see `build.rs`);
 - the source editor is created only on the first switch to an editing mode;
 - image decoding threads are created lazily;
 - static CRT, LTO, `codegen-units = 1`.

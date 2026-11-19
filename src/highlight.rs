@@ -402,7 +402,10 @@ pub fn spans(info: &str, code: &str) -> Vec<(Kind, Range<usize>)> {
             } else {
                 word
             };
-            let next = code[j..].trim_start_matches([' ', '\t']).chars().next().unwrap_or(' ');
+            let after = code[j..].trim_start_matches([' ', '\t']);
+            let next = after.chars().next().unwrap_or(' ');
+            // Rust macro call `name!(…)`; `a != b` is a comparison, not a macro.
+            let bang_macro = next == '!' && lang.keywords == RUST_KW && !after[1..].starts_with('=');
             let kind = if lang.keywords.contains(&w) {
                 Kind::Keyword
             } else if lang.types.contains(&w) {
@@ -411,7 +414,7 @@ pub fn spans(info: &str, code: &str) -> Vec<(Kind, Range<usize>)> {
                 Kind::Attr
             } else if matches!(lang.family, Family::Config) && (next == '=' || next == ':') && line_start {
                 Kind::Attr
-            } else if next == '(' || (next == '!' && lang.keywords == RUST_KW) {
+            } else if next == '(' || bang_macro {
                 Kind::Func
             } else if lang.pascal_types && word.chars().next().map(|ch| ch.is_uppercase()).unwrap_or(false) && word.chars().any(|ch| ch.is_lowercase()) {
                 Kind::Type
@@ -419,7 +422,7 @@ pub fn spans(info: &str, code: &str) -> Vec<(Kind, Range<usize>)> {
                 Kind::Plain
             };
             // Rust macro: highlight the "!" too
-            let j2 = if kind == Kind::Func && next == '!' && code[j..].starts_with('!') { j + 1 } else { j };
+            let j2 = if kind == Kind::Func && bang_macro && code[j..].starts_with('!') { j + 1 } else { j };
             push(kind, i..j2);
             i = j2;
             line_start = false;
@@ -486,13 +489,378 @@ mod tests {
         ] {
             let t = std::time::Instant::now();
             let s = spans(lang, &code);
-            assert!(t.elapsed().as_secs() < 2, "{lang}");
+            // Catches quadratic time; a debug build with coverage instrumentation is much slower.
+            assert!(t.elapsed().as_secs() < if cfg!(debug_assertions) { 30 } else { 2 }, "{lang}");
             let mut pos = 0;
             for (_, r) in &s {
                 assert_eq!(r.start, pos, "{lang}: gap");
                 pos = r.end;
             }
             assert_eq!(pos, code.len(), "{lang}: not all text is covered");
+        }
+    }
+
+    use Kind::*;
+
+    /// Spans are contiguous, non-empty, on char boundaries, never two equal kinds in a row.
+    fn check_cover(lang: &str, code: &str) {
+        let s = spans(lang, code);
+        let mut pos = 0;
+        for (i, (k, r)) in s.iter().enumerate() {
+            assert_eq!(r.start, pos, "{lang}: gap in {code:?}");
+            assert!(r.start < r.end, "{lang}: empty span");
+            assert!(code.is_char_boundary(r.start) && code.is_char_boundary(r.end), "{lang}: not a char boundary");
+            if i > 0 {
+                assert_ne!(s[i - 1].0, *k, "{lang}: adjacent spans of the same kind are merged");
+            }
+            pos = r.end;
+        }
+        assert_eq!(pos, code.len(), "{lang}: {code:?}");
+    }
+
+    #[test]
+    fn kind_codes_round_trip() {
+        for k in [Plain, Keyword, Type, Str, Num, Comment, Func, Attr] {
+            assert_eq!(Kind::from_code(k.code()), k);
+        }
+        assert_eq!(Kind::from_code(8), Plain);
+        assert_eq!(Kind::from_code(u32::MAX), Plain);
+        assert_eq!(Attr.code(), 7);
+    }
+
+    #[test]
+    fn plain_and_oversized_blocks() {
+        let code = "fn main() { \"x\" } // 1";
+        for lang in ["", "text", "TXT", "plain", "plaintext", "md", "markdown", "output", "log"] {
+            assert_eq!(spans(lang, code), vec![(Plain, 0..code.len())], "{lang:?}");
+            assert!(spans(lang, "").is_empty());
+        }
+        assert!(spans("rust", "").is_empty());
+        let big = "fn ".repeat(MAX_HIGHLIGHT / 3 + 1);
+        assert_eq!(spans("rust", &big), vec![(Plain, 0..big.len())], "above the limit — no highlighting");
+        let fits = "fn ".repeat(MAX_HIGHLIGHT / 3);
+        assert_eq!(spans("rust", &fits)[0], (Keyword, 0..2));
+    }
+
+    /// The info string may carry attributes: only the first word counts, case-insensitively.
+    #[test]
+    fn language_name_parsing() {
+        assert_eq!(kinds("rust,ignore", "fn"), vec![(Keyword, "fn")]);
+        assert_eq!(kinds("  Python {.class}", "def"), vec![(Keyword, "def")]);
+        assert_eq!(kinds("JS{x}", "const"), vec![(Keyword, "const")]);
+        assert_eq!(kinds("bash title=\"x\"", "echo"), vec![(Keyword, "echo")]);
+        // an unknown language gets generic highlighting: strings (also '…'), numbers, comments, calls
+        assert_eq!(kinds("brainfork", "x = 'a' // c\nf(1) fn"), vec![(Str, "'a'"), (Comment, "// c"), (Func, "f"), (Num, "1")]);
+    }
+
+    #[test]
+    fn diff_lines() {
+        let code = "@@ -1 +1 @@\n ctx\n-old\n+new\nlast";
+        assert_eq!(kinds("patch", code), vec![(Attr, "@@ -1 +1 @@\n"), (Keyword, "-old\n"), (Str, "+new\n")]);
+        check_cover("diff", code);
+        assert_eq!(kinds("diff", "+a\n+b\n"), vec![(Str, "+a\n+b\n")], "equal neighbours merge");
+    }
+
+    #[test]
+    fn config_files() {
+        let code = "# comment\nname = \"x\"\nflag: yes\n; semi\nurl=http://a#b\n  key = 1 # tail\nb: 'q'\t; t";
+        assert_eq!(
+            kinds("toml", code),
+            vec![
+                (Comment, "# comment"),
+                (Attr, "name"),
+                (Str, "\"x\""),
+                (Attr, "flag"),
+                (Keyword, "yes"),
+                (Comment, "; semi"),
+                (Attr, "url"),
+                (Attr, "key"),
+                (Num, "1"),
+                (Comment, "# tail"),
+                (Attr, "b"),
+                (Str, "'q'"),
+                (Comment, "; t"),
+            ]
+        );
+        for lang in ["yaml", "yml", "ini", "cfg", "conf", "properties", "env", "editorconfig", "gitignore"] {
+            check_cover(lang, code);
+            assert_eq!(kinds(lang, "a: on")[1], (Keyword, "on"), "{lang}");
+        }
+    }
+
+    #[test]
+    fn powershell_and_batch() {
+        let code = "<# block\n#>\n$env:PATH = \"C:\\dir\\\" + 'x'\nfunction Get-It { param($a) } # c\nWrite-Host -Object $a";
+        assert_eq!(
+            kinds("powershell", code),
+            vec![
+                (Comment, "<# block\n#>"),
+                (Attr, "$env:PATH"),
+                (Str, "\"C:\\dir\\\""), // a backslash is not an escape in PowerShell
+                (Str, "'x'"),
+                (Keyword, "function"),
+                (Keyword, "param"),
+                (Attr, "$a"),
+                (Comment, "# c"),
+                (Attr, "$a"),
+            ]
+        );
+        for lang in ["ps1", "pwsh", "ps", "bat", "cmd", "batch"] {
+            check_cover(lang, code);
+        }
+        assert_eq!(kinds("ps1", "<# open"), vec![(Comment, "<# open")]);
+    }
+
+    #[test]
+    fn shell_variables_and_strings() {
+        let code = "echo \"$HOME\" ${PATH} $1 # c\nexport A=`date`\nX=${unclosed\nok";
+        assert_eq!(
+            kinds("bash", code),
+            vec![
+                (Keyword, "echo"),
+                (Str, "\"$HOME\""),
+                (Attr, "${PATH}"),
+                (Attr, "$1"),
+                (Comment, "# c"),
+                (Keyword, "export"),
+                (Str, "`date`"),
+                (Attr, "${unclosed"),
+            ]
+        );
+        for lang in ["sh", "zsh", "shell", "console", "shellsession", "fish", "dockerfile", "makefile", "make"] {
+            check_cover(lang, code);
+        }
+    }
+
+    #[test]
+    fn php_variables() {
+        assert_eq!(
+            kinds("php", "<?php\n$x = array(1); // c\n# h\necho $y;"),
+            vec![(Attr, "$x"), (Keyword, "array"), (Num, "1"), (Comment, "// c"), (Attr, "# h"), (Keyword, "echo"), (Attr, "$y")]
+        );
+        // "$" is a variable only in PHP among the C-like languages
+        assert_eq!(kinds("js", "$x"), vec![]);
+    }
+
+    #[test]
+    fn lua_comments() {
+        let code = "-- line\n--[[ block\n]] local s = 'a' .. \"b\"\nprint(#t) --[[open";
+        assert_eq!(
+            kinds("lua", code),
+            vec![(Comment, "-- line"), (Comment, "--[[ block\n]]"), (Keyword, "local"), (Str, "'a'"), (Str, "\"b\""), (Func, "print"), (Comment, "--[[open")]
+        );
+        check_cover("luau", code);
+    }
+
+    #[test]
+    fn sql_is_case_insensitive() {
+        let code = "SELECT name, COUNT(*) FROM t WHERE id = 1 -- c\n/* b */ select x::VARCHAR as n";
+        assert_eq!(
+            kinds("sql", code),
+            vec![
+                (Keyword, "SELECT"),
+                (Func, "COUNT"),
+                (Keyword, "FROM"),
+                (Keyword, "WHERE"),
+                (Num, "1"),
+                (Comment, "-- c"),
+                (Comment, "/* b */"),
+                (Keyword, "select"),
+                (Type, "VARCHAR"),
+                (Keyword, "as"),
+            ]
+        );
+        for lang in ["mysql", "postgres", "postgresql", "sqlite", "plsql", "tsql"] {
+            check_cover(lang, code);
+        }
+        // other languages are case-sensitive
+        assert_eq!(kinds("python", "DEF"), vec![]);
+    }
+
+    #[test]
+    fn markup_tags_and_attributes() {
+        let code = "<!-- c --><a href=\"x\" data-id='1' xml:lang=en>Текст 5</a>\n<?xml?><!DOCTYPE html>a < b";
+        assert_eq!(
+            kinds("html", code),
+            vec![
+                (Comment, "<!-- c -->"),
+                (Keyword, "a"),
+                (Attr, "href"),
+                (Str, "\"x\""),
+                (Attr, "data-id"),
+                (Str, "'1'"),
+                (Attr, "xml:lang"),
+                (Keyword, "a"),
+                (Keyword, "xml"),
+                (Keyword, "DOCTYPE"),
+            ]
+        );
+        for lang in ["htm", "xml", "svg", "xaml", "xhtml", "plist", "csproj"] {
+            check_cover(lang, code);
+        }
+        assert_eq!(kinds("xml", "<!-- open <a>"), vec![(Comment, "<!-- open <a>")]);
+        assert_eq!(kinds("xml", "<ns:tag.x-y_z>"), vec![(Keyword, "ns:tag.x-y_z")]);
+    }
+
+    #[test]
+    fn css_properties() {
+        let code = "@media screen {\n  .a { color: red; font-size: 12px; } /* c */\n} // x";
+        assert_eq!(
+            kinds("css", code),
+            vec![(Attr, "@media"), (Attr, "color"), (Attr, "font-size"), (Num, "12px"), (Comment, "/* c */"), (Comment, "// x")]
+        );
+        for lang in ["scss", "less", "sass"] {
+            check_cover(lang, code);
+        }
+    }
+
+    #[test]
+    fn json_keys_numbers_comments() {
+        let code = "{\"k\" : -1.5e3, // c\n\"s\": \"v\\\"\", /* b */ \"n\": null}";
+        assert_eq!(
+            kinds("jsonc", code),
+            vec![(Attr, "\"k\""), (Num, "1.5e3"), (Comment, "// c"), (Attr, "\"s\""), (Str, "\"v\\\"\""), (Comment, "/* b */"), (Attr, "\"n\""), (Keyword, "null")]
+        );
+        for lang in ["json", "json5", "geojson"] {
+            check_cover(lang, code);
+        }
+        // "'" is not a string quote in JSON
+        assert_eq!(kinds("json", "'a'"), vec![]);
+    }
+
+    #[test]
+    fn ruby_python_go() {
+        assert_eq!(
+            kinds("ruby", "# c\nclass MyApp\n  def run(x)\n    @v = nil\n  end\nend"),
+            vec![(Comment, "# c"), (Keyword, "class"), (Type, "MyApp"), (Keyword, "def"), (Func, "run"), (Keyword, "nil"), (Keyword, "end"), (Keyword, "end")]
+        );
+        check_cover("rb", "x = 'y' # z");
+        check_cover("rake", "task :a do\nend");
+        let py = "@app.route('/')\ndef f(self) -> int:\n    \"\"\"doc\n    string\"\"\"\n    return MyType(True)  # c\n'''open";
+        assert_eq!(
+            kinds("py3", py),
+            vec![
+                (Attr, "@app.route"),
+                (Str, "'/'"),
+                (Keyword, "def"),
+                (Func, "f"),
+                (Keyword, "self"),
+                (Type, "int"),
+                (Str, "\"\"\"doc\n    string\"\"\""),
+                (Keyword, "return"),
+                (Func, "MyType"),
+                (Keyword, "True"),
+                (Comment, "# c"),
+                (Str, "'''open"),
+            ]
+        );
+        for lang in ["python3", "gdscript"] {
+            check_cover(lang, py);
+        }
+        let go = "func main() {\n\ts := `raw\nline`\n\tvar e error\n}";
+        assert_eq!(kinds("golang", go), vec![(Keyword, "func"), (Func, "main"), (Str, "`raw\nline`"), (Keyword, "var"), (Type, "error")]);
+    }
+
+    #[test]
+    fn c_family_and_js() {
+        assert_eq!(
+            kinds("cpp", "#include <stdio.h>\nint main(void) { return 0; } /* open"),
+            vec![(Attr, "#include <stdio.h>"), (Type, "int"), (Func, "main"), (Type, "void"), (Keyword, "return"), (Num, "0"), (Comment, "/* open")]
+        );
+        assert_eq!(
+            kinds("java", "@Override public String toString() { return null; }"),
+            vec![(Attr, "@Override"), (Keyword, "public"), (Type, "String"), (Func, "toString"), (Keyword, "return"), (Keyword, "null")]
+        );
+        assert_eq!(
+            kinds("ts", "@Component()\nconst t = `a ${b}`; let s = 'q'; new Promise(r => r(0x1F));\nclass MyComp {}"),
+            vec![
+                (Attr, "@Component"),
+                (Keyword, "const"),
+                (Str, "`a ${b}`"),
+                (Keyword, "let"),
+                (Str, "'q'"),
+                (Keyword, "new"),
+                (Type, "Promise"),
+                (Func, "r"),
+                (Num, "0x1F"),
+                (Keyword, "class"),
+                (Type, "MyComp"),
+            ]
+        );
+        for lang in [
+            "c", "h", "c++", "cc", "cxx", "hpp", "hxx", "objc", "cuda", "glsl", "hlsl", "cs", "csharp", "c#", "kotlin", "kt", "scala", "swift",
+            "dart", "javascript", "jsx", "mjs", "cjs", "typescript", "tsx", "vue", "svelte", "go",
+        ] {
+            check_cover(lang, "#if X\n@a f(\"s\\\"\", 'c', `t`, 1.5) // c\n/* d */");
+        }
+    }
+
+    #[test]
+    fn rust_details() {
+        let code = "#[derive(Debug)]\n#![allow(x)]\nfn f<'a>(s: &'a str) -> Result<MyType, HTTP> {\n    let v = vec![1_000u32, 0xFF, 3.14]; // c\n    let c = 'x'; x1 + 1..2\n}\n#[unclosed\n\"esc \\\" q\" \"open\nlet";
+        assert_eq!(
+            kinds("rs", code),
+            vec![
+                (Attr, "#[derive(Debug)]"),
+                (Attr, "#![allow(x)]"),
+                (Keyword, "fn"),
+                (Type, "str"),
+                (Type, "Result"),
+                (Type, "MyType"),
+                (Keyword, "let"),
+                (Func, "vec!"),
+                (Num, "1_000u32"),
+                (Num, "0xFF"),
+                (Num, "3.14"),
+                (Comment, "// c"),
+                (Keyword, "let"),
+                (Num, "1"),
+                (Num, "2"),
+                (Attr, "#[unclosed"),
+                (Str, "\"esc \\\" q\""),
+                (Str, "\"open"),
+                (Keyword, "let"),
+            ]
+        );
+        check_cover("rust", code);
+        // a backslash at the very end of an unclosed string does not run past the text
+        assert_eq!(kinds("rust", "\"abc\\"), vec![(Str, "\"abc\\")]);
+    }
+
+    /// `a != b` is a comparison: the identifier is not a function or a macro.
+    #[test]
+    fn not_equal_is_not_a_macro() {
+        for code in ["a != b", "x!= y", "x!=y", "a \t!= b", "Foo != bar"] {
+            assert!(!kinds("rust", code).iter().any(|(k, _)| *k == Func), "{code:?}: {:?}", kinds("rust", code));
+        }
+        assert_eq!(kinds("rust", "if a!=b { c }"), vec![(Keyword, "if")]);
+        // real macros keep their color, with or without a space before the delimiter
+        assert_eq!(
+            kinds("rust", "println!(\"x\"); vec![1]; m! {} macro_rules! name x!(y != z)"),
+            vec![(Func, "println!"), (Str, "\"x\""), (Func, "vec!"), (Num, "1"), (Func, "m!"), (Func, "macro_rules!"), (Func, "x!")]
+        );
+        // other languages never had "!" macros
+        assert_eq!(kinds("js", "a != b"), vec![]);
+    }
+
+    /// Any input in any language: no panic, contiguous spans on char boundaries.
+    #[test]
+    fn unicode_and_odd_inputs_never_break_spans() {
+        let langs = [
+            "rust", "c", "cs", "js", "go", "py", "sh", "ps1", "sql", "html", "css", "toml", "json", "lua", "ruby", "php", "diff", "text", "unknown",
+        ];
+        let samples = [
+            "привет \"мир\\п\" 'я' `ё` // комм\n# ш\n-- ж",
+            "$\u{1F600}${я}#[ж]@ф <т ф=\"х\"> 日本 1.五 0x",
+            "\"\\\u{1F600}\" '\\é' \\",
+            "<# ключ #> --[[ блок ]] /* ц */ <!-- э -->",
+            "\n\n\t  \r\n",
+            "@", "$", "#", "<", "-", "'", "\"", "`", "/", "1.", "--", "<#", "--[[", "<!--", "\"\"\"", "${", "#[", "#![",
+        ];
+        for lang in langs {
+            for s in samples {
+                check_cover(lang, s);
+            }
         }
     }
 }

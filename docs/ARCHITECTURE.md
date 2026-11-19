@@ -31,9 +31,10 @@ Alternatives were measured or estimated when the stack was chosen (C++ Win32, C#
 | `images.rs` | Resolving image `src` by policy, a decoding thread pool, re-encoding into clean PNG/JPEG. |
 | `net.rs` | Downloading images from the internet via WinHTTP (only with permission). |
 | `richedit.rs` | A thin wrapper over RichEdit messages. |
+| `emoji.rs` | Color emoji in the view: RichEdit draws through GDI (no color fonts), so each emoji cluster is rendered once with DirectWrite/Direct2D (Segoe UI Emoji) into a cached bitmap and blended over RichEdit's monochrome glyph. |
 | `ui.rs` | Custom GDI bars: toolbar, info bar, status bar. |
 | `doc.rs` | Reading/writing: encodings (UTF-8/BOM, UTF-16, ANSI), line endings, atomic save. |
-| `install.rs` | Installation, registry, the system “Open with” dialog, update, uninstall. |
+| `install.rs` | Installation, registry, opening Windows Settings → Default apps, update, uninstall. |
 | `i18n.rs` | Interface language: English/Russian, the `tr!` and `trf!` macros. |
 | `settings.rs`, `theme.rs`, `dialogs.rs`, `util.rs` | Settings, theme colors, system dialogs, Win32 helpers. |
 

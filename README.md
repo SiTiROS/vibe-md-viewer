@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A fast native Markdown viewer and editor for Windows 10/11.
-A single small `exe` (≈ 2.6 MB), no browser engine (no Edge / WebView2 / Electron), no internet access by default. Written in Rust on top of Win32 and RichEdit.
+A single small `exe` (≈ 2.7 MB), no browser engine (no Edge / WebView2 / Electron), no internet access by default. Written in Rust on top of Win32 and RichEdit.
 
 **Download:** [latest release](https://github.com/SiTiROS/vibe-md-viewer/releases/latest) → `vibe-md-viewer-<version>-setup.exe`. The exe is built from the tagged sources by GitHub Actions; SHA-256 checksums and a build provenance attestation are published next to it.
 
@@ -30,7 +30,7 @@ It installs like ordinary software: into Program Files, without shortcuts, servi
    - Windows asks for administrator rights (UAC) — only for the duration of the installation;
    - the program copies itself to `C:\Program Files\vibe-md-viewer` (for all users — only there, so a regular user cannot tamper with it) and registers for `.md`, `.markdown` and similar extensions for all users, plus an entry in “Apps & features”;
    - without administrator rights (e.g. a work PC) it offers a just-for-me installation into `%LOCALAPPDATA%\Programs\vibe-md-viewer`, without UAC;
-   - then the system “How do you want to open this file?” window appears: choose **vibe-md-viewer** and tick “Always use this app”.
+   - then Windows Settings → Default apps opens: on Windows 11 the vibe-md-viewer page (set it for `.md`), on Windows 10 click “Choose default apps by file type”, find `.md` and pick **vibe-md-viewer**. The same from the start page: “Make default app for .md”.
 
 The viewer itself always runs with normal rights — elevated rights are needed only by the installer copy, for a few seconds.
 
@@ -89,7 +89,7 @@ In lists Enter continues the list, Enter on an empty item ends it, Tab / Shift+T
 
 ## Modes
 
-- **View** — the formatted document: headings, lists, tasks, quotes, GitHub alerts (`> [!NOTE]`), tables, code blocks with syntax highlighting (Rust, C/C++/C#, Java, JS/TS, Go, Python, Shell, PowerShell, SQL, HTML/XML, CSS, JSON/YAML/TOML/INI, Lua, Ruby, diff), images, footnotes, front matter, a safe subset of HTML (`<img>`, `<br>`, `<b>`, `<kbd>`, `<details>`, `align="center"`…). Full-width text or a narrow column — a toggle on the toolbar.
+- **View** — the formatted document: headings, lists, tasks, quotes, GitHub alerts (`> [!NOTE]`), tables, code blocks with syntax highlighting (Rust, C/C++/C#, Java, JS/TS, Go, Python, Shell, PowerShell, SQL, HTML/XML, CSS, JSON/YAML/TOML/INI, Lua, Ruby, diff), images, color emoji ✅ 🟡 ❌, footnotes, front matter, a safe subset of HTML (`<img>`, `<br>`, `<b>`, `<kbd>`, `<details>`, `align="center"`…). Full-width text or a narrow column — a toggle on the toolbar.
 - **Visual** — editing “as a user”: Markdown markup characters are hidden and appear only on the line with the cursor. The file always stays plain Markdown and is saved without losses.
 - **Code** — the Markdown source with markup highlighting on the left and a live preview on the right.
 

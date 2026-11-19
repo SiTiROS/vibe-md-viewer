@@ -25,7 +25,7 @@
 ## Команды
 
 ```powershell
-# релиз → dist\vibe-md-viewer.exe (≈2.6 МБ)
+# релиз → dist\vibe-md-viewer.exe (≈2.7 МБ)
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 # то же + тесты
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Test
@@ -68,6 +68,24 @@ powershell -ExecutionPolicy Bypass -File scripts\make-icon.ps1
 
 Пользователь обновляется запуском нового exe (см. README, «Обновление»). Сравнение версий — числовое `a.b.c`: обновление предлагается только если новая версия больше установленной.
 
+## Покрытие кода тестами
+
+`scripts\coverage.ps1` собирает программу со счётчиками покрытия (`-C instrument-coverage`, в `target\cov`), прогоняет юнит-тесты, самотест на живом окне и служебные режимы (`--profile` на большом документе, снимки, время запуска, окно установщика — ничего не устанавливается) и печатает покрытие строк по файлам; `-Html` дополнительно пишет HTML-отчёт в `.toolcache\coverage\html`, `-MinLines N` падает, если покрытие ниже N%.
+
+Нужны `llvm-profdata.exe` и `llvm-cov.exe` той же версии LLVM, что у `rustc` (`rustc -vV`). В CI они берутся из компонента rustup `llvm-tools`. Локально, чтобы ничего не ставить на диск C:, они кладутся в `.toolcache\llvm-tools`: архив `llvm-tools-<версия>-x86_64-pc-windows-msvc.tar.xz` для вашей версии `rustc` — по манифесту `https://static.rust-lang.org/dist/channel-rust-<версия>.toml`, из него достаются только эти два файла.
+
+Сейчас покрытие строк — **87,7%**. Основные модули покрыты на 96–100%: render, html, highlight, styler, editor, richedit, links, images, doc, settings, theme, emoji.
+
+Что не покрыто и почему:
+- модальные окна и системные диалоги (вопросы, открытие/сохранение файла, UAC): `dialogs.rs` — 0%, окно установщика — 56%;
+- установка в Program Files и HKLM с правами администратора (`install.rs` — 72%);
+- настоящая загрузка из интернета;
+- ветки на случай отказа вызовов Win32.
+
+Всё остальное покрыто юнит-тестами или самотестом. 100% недостижимы без человека, который проходит UAC и диалоги.
+
+Задача CI `coverage` запускает тот же скрипт с `-MinLines 85` и показывает сводку на странице прогона; HTML-отчёт — артефактом.
+
 ## Ключи командной строки
 
 | Ключ | Назначение |
@@ -102,7 +120,7 @@ powershell -ExecutionPolicy Bypass -File scripts\make-icon.ps1
 
 Что уже сделано для скорости:
 
-- редкие DLL (WinHTTP, shell32, comdlg32, ole32, oleaut32) загружаются отложенно (`/DELAYLOAD`, см. `build.rs`);
+- редкие DLL (WinHTTP, shell32, comdlg32, ole32, oleaut32; d2d1 и dwrite для цветных эмодзи — только после первой отрисовки документа с эмодзи) загружаются отложенно (`/DELAYLOAD`, см. `build.rs`);
 - редактор исходника создаётся только при первом переходе в режим правки;
 - потоки декодирования картинок создаются лениво;
 - статический CRT, LTO, `codegen-units = 1`.

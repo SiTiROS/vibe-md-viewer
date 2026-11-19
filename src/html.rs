@@ -88,12 +88,13 @@ fn parse_tag(s: &str) -> Option<(Tok, usize)> {
         let end = s.find('>')?;
         return Some((Tok::Comment, end + 1));
     }
+    // A tag name starts with a letter (as in HTML): `a <3 and b> 2` is text.
+    if !b.get(i).is_some_and(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
     let name_start = i;
     while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'-' || b[i] == b':') {
         i += 1;
-    }
-    if i == name_start {
-        return None;
     }
     let name = s[name_start..i].to_ascii_lowercase();
     if closing {
@@ -160,7 +161,7 @@ pub fn is_skipped_container(name: &str) -> bool {
     matches!(
         name,
         "script" | "style" | "iframe" | "object" | "embed" | "template" | "noscript" | "svg" | "math"
-            | "canvas" | "video" | "audio" | "head" | "title" | "frameset" | "frame" | "applet" | "textarea"
+            | "canvas" | "video" | "audio" | "head" | "title" | "frameset" | "frame" | "applet" | "textarea" | "form"
     )
 }
 
@@ -281,5 +282,218 @@ mod tests {
     fn broken_html_is_text() {
         let t = tokenize("a < b and <unclosed");
         assert_eq!(t, vec![Tok::Text("a < b and <unclosed".into())]);
+    }
+
+    fn open(name: &str, attrs: &[(&str, &str)], self_closing: bool) -> Tok {
+        Tok::Open { name: name.into(), attrs: attrs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), self_closing }
+    }
+
+    fn text(s: &str) -> Tok {
+        Tok::Text(s.into())
+    }
+
+    #[test]
+    fn attribute_syntax_variants() {
+        // Quotes of both kinds, unquoted values, bare attributes, spaces around '='.
+        assert_eq!(
+            tokenize("<a href = \"x y\" title='q \"z\"' data-x=z checked>"),
+            vec![open("a", &[("href", "x y"), ("title", "q \"z\""), ("data-x", "z"), ("checked", "")], false)]
+        );
+        // Names are lower-cased, values are not; entities in values are decoded once.
+        assert_eq!(
+            tokenize("<IMG SRC=\"A.png\" Alt=\"&lt;b&gt; &amp;amp;\"/>"),
+            vec![open("img", &[("src", "A.png"), ("alt", "<b> &amp;")], true)]
+        );
+        // Junk characters and a value without a name are skipped.
+        assert_eq!(tokenize("<img / src=\"a.png\">"), vec![open("img", &[("src", "a.png")], false)]);
+        assert_eq!(tokenize("<a =\"x\" href=\"h\">"), vec![open("a", &[("href", "h")], false)]);
+        // Namespaced and hyphenated names.
+        assert_eq!(tokenize("<my-el x:y=1>"), vec![open("my-el", &[("x:y", "1")], false)]);
+        // Unicode in values and text.
+        assert_eq!(tokenize("<p title=\"привет\">т</p>"), vec![open("p", &[("title", "привет")], false), text("т"), Tok::Close("p".into())]);
+        // A closing tag ignores anything after its name.
+        assert_eq!(tokenize("</B junk>"), vec![Tok::Close("b".into())]);
+    }
+
+    #[test]
+    fn attribute_count_is_capped_and_first_wins() {
+        let many: String = (0..100).map(|i| format!(" a{i}=\"{i}\"")).collect();
+        match &tokenize(&format!("<x{many}>"))[0] {
+            Tok::Open { attrs, .. } => {
+                assert_eq!(attrs.len(), MAX_ATTRS);
+                assert_eq!(attrs[MAX_ATTRS - 1], (format!("a{}", MAX_ATTRS - 1), format!("{}", MAX_ATTRS - 1)));
+            }
+            t => panic!("{t:?}"),
+        }
+        let t = tokenize("<a href=\"1\" HREF=\"2\">");
+        match &t[0] {
+            Tok::Open { attrs, .. } => {
+                assert_eq!(attr(attrs, "href"), Some("1"));
+                assert_eq!(attr(attrs, "missing"), None);
+            }
+            t => panic!("{t:?}"),
+        }
+    }
+
+    #[test]
+    fn comments_doctype_and_processing_instructions() {
+        assert_eq!(tokenize("<!DOCTYPE html><?xml version=\"1.0\"?>x</!x>"), vec![Tok::Comment, Tok::Comment, text("x"), Tok::Comment]);
+        assert_eq!(tokenize("a<!--x-->b"), vec![text("a"), Tok::Comment, text("b")]);
+        // A comment may contain '>' and tags.
+        assert_eq!(tokenize("<!-- <b>x</b> > -->y"), vec![Tok::Comment, text("y")]);
+        // An unclosed comment swallows the rest.
+        assert_eq!(tokenize("a<!-- <b>secret"), vec![text("a"), Tok::Comment]);
+    }
+
+    #[test]
+    fn malformed_tags_stay_text() {
+        for s in [
+            "< b>",
+            "</ >",
+            "<>",
+            "a > b",
+            "x<",
+            "<a href=\"x>t",
+            "<1",
+            "a <= b",
+        ] {
+            assert_eq!(tokenize(s), vec![text(s)], "{s:?}");
+        }
+        // After a broken tag, later tags still parse.
+        assert_eq!(tokenize("<a title=\"x>y <b>z"), vec![text("<a title=\"x>y "), open("b", &[], false), text("z")]);
+        assert_eq!(tokenize("<b>x"), vec![open("b", &[], false), text("x")]);
+        // A tag ends at the first '>' outside quotes only within its own segment.
+        assert_eq!(tokenize("<a title='a>b'>"), vec![text("<a title='a>b'>")]);
+    }
+
+    #[test]
+    fn tag_length_limit() {
+        // A segment up to MAX_TAG_LEN bytes is a tag.
+        let ok = format!("<a{}>", " x".repeat((MAX_TAG_LEN - 3) / 2));
+        assert!(ok.len() <= MAX_TAG_LEN);
+        assert!(matches!(&tokenize(&ok)[..], [Tok::Open { name, .. }] if name == "a"));
+        // MAX_TAG_LEN + 1 bytes ('>' cut off by the limit) and anything longer is text.
+        let edge = format!("<a{}>", " x".repeat((MAX_TAG_LEN - 2) / 2));
+        assert_eq!(edge.len(), MAX_TAG_LEN + 1);
+        assert_eq!(tokenize(&edge), vec![text(&edge)]);
+        let long = format!("<a title=\"{}\">t", "x".repeat(5000));
+        assert_eq!(tokenize(&long), vec![text(&long)]);
+        // Many unterminated tags stay linear and become text.
+        let bomb = "<a ".repeat(50_000);
+        let t = std::time::Instant::now();
+        assert_eq!(tokenize(&bomb), vec![text(&bomb)]);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn hidden_containers_and_block_spanning() {
+        for n in [
+            "script", "style", "iframe", "object", "embed", "template", "noscript", "svg", "math", "canvas", "video", "audio", "head", "title",
+            "frameset", "frame", "applet", "textarea", "form",
+        ] {
+            assert!(is_skipped_container(n), "{n}");
+        }
+        for n in ["b", "a", "img", "div", "p", "span", "details", "summary", ""] {
+            assert!(!is_skipped_container(n), "{n}");
+        }
+        for n in ["script", "style", "textarea"] {
+            assert!(skip_spans_blocks(n), "{n}");
+        }
+        for n in ["iframe", "template", "svg", "object", "form", "b"] {
+            assert!(!skip_spans_blocks(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn tag_names_start_with_a_letter() {
+        for s in ["a <3 and b> 2", "x </3> y", "<1x>", "<-a>", "<:a>"] {
+            assert_eq!(tokenize(s), vec![text(s)], "{s:?}");
+        }
+        // Digits, '-' and ':' are fine after the first letter.
+        assert_eq!(tokenize("<h1>"), vec![open("h1", &[], false)]);
+        assert_eq!(tokenize("</x-1>"), vec![Tok::Close("x-1".into())]);
+    }
+
+    /// The tokenizer works on a whole HTML block: comments and tags may span lines.
+    #[test]
+    fn multi_line_comments_and_tags() {
+        assert_eq!(tokenize("<!--\nsecret\n-->\nx"), vec![Tok::Comment, text("\nx")]);
+        assert_eq!(tokenize("<img\n  src=\"a.png\"\n  alt=\"b\">"), vec![open("img", &[("src", "a.png"), ("alt", "b")], false)]);
+    }
+
+    #[test]
+    fn numeric_entities() {
+        for (s, want) in [
+            ("&#65;", "A"),
+            ("&#x41;", "A"),
+            ("&#X41;", "A"),
+            ("&#x1F600;", "😀"),
+            ("&#1078;", "ж"),
+            ("&#xE000;", "\u{E000}"),
+            // Invalid numbers stay as written: NUL, surrogates, out of range, garbage, empty.
+            ("&#0;", "&#0;"),
+            ("&#x0;", "&#x0;"),
+            ("&#xD800;", "&#xD800;"),
+            ("&#1114112;", "&#1114112;"),
+            ("&#x110000;", "&#x110000;"),
+            ("&#xZZ;", "&#xZZ;"),
+            ("&#;", "&#;"),
+            ("&#x;", "&#x;"),
+            ("&#-1;", "&#-1;"),
+            ("&#99999999999999999999;", "&#99999999999999999999;"),
+        ] {
+            assert_eq!(decode_entities(s), want, "{s}");
+        }
+    }
+
+    #[test]
+    fn named_entities() {
+        let all = [
+            ("amp", '&'), ("lt", '<'), ("gt", '>'), ("quot", '"'), ("apos", '\''), ("nbsp", '\u{A0}'), ("copy", '©'), ("reg", '®'),
+            ("trade", '™'), ("mdash", '—'), ("ndash", '–'), ("hellip", '…'), ("laquo", '«'), ("raquo", '»'), ("bull", '•'),
+            ("middot", '·'), ("times", '×'), ("divide", '÷'), ("deg", '°'), ("plusmn", '±'), ("larr", '←'), ("rarr", '→'),
+            ("uarr", '↑'), ("darr", '↓'), ("harr", '↔'), ("check", '✓'), ("euro", '€'), ("pound", '£'), ("yen", '¥'), ("sect", '§'),
+            ("para", '¶'), ("shy", '\u{AD}'), ("zwj", '\u{200D}'), ("zwnj", '\u{200C}'), ("ensp", '\u{2002}'), ("emsp", '\u{2003}'),
+            ("thinsp", '\u{2009}'), ("lsquo", '‘'), ("rsquo", '’'), ("ldquo", '“'), ("rdquo", '”'), ("bdquo", '„'), ("hearts", '♥'),
+            ("star", '☆'),
+        ];
+        for (name, c) in all {
+            assert_eq!(decode_entities(&format!("x&{name};y")), format!("x{c}y"), "&{name};");
+            // Names are case-sensitive.
+            if name.to_uppercase() != name {
+                let up = format!("&{};", name.to_uppercase());
+                assert_eq!(decode_entities(&up), up);
+            }
+        }
+    }
+
+    #[test]
+    fn entity_edge_cases() {
+        // Without '&' the input is returned as is.
+        assert_eq!(decode_entities("plain <text>"), "plain <text>");
+        // No ';', unknown names, stray ampersands.
+        assert_eq!(decode_entities("&amp"), "&amp");
+        assert_eq!(decode_entities("&unknown; & &;"), "&unknown; & &;");
+        assert_eq!(decode_entities("&&amp;&"), "&&&");
+        assert_eq!(decode_entities("a&lt;&gt;&quot;&apos;b"), "a<>\"'b");
+        // Decoded once: no double decoding into markup.
+        assert_eq!(decode_entities("&amp;lt;script&amp;gt;"), "&lt;script&gt;");
+        // ';' is looked for only in the first 32 bytes.
+        let far = format!("&{};", "a".repeat(40));
+        assert_eq!(decode_entities(&far), far);
+        let near = format!("&#{}65;", "0".repeat(28));
+        assert_eq!(near.find(';'), Some(32));
+        assert_eq!(decode_entities(&near), "A");
+        let too_far = format!("&#{}65;", "0".repeat(29));
+        assert_eq!(decode_entities(&too_far), too_far);
+        // Multibyte text around entities.
+        assert_eq!(decode_entities("ж&amp;ж&#x416;"), "ж&жЖ");
+        // Text tokens are decoded too.
+        assert_eq!(tokenize("a &lt; b"), vec![text("a < b")]);
+        // A million ampersands stay linear.
+        let amps = "&".repeat(1_000_000);
+        let t = std::time::Instant::now();
+        assert_eq!(decode_entities(&amps), amps);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
     }
 }

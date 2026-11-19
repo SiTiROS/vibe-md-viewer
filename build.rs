@@ -22,6 +22,9 @@ fn main() {
         "dwmapi.dll",
         "ws2_32.dll",
         "bcryptprimitives.dll",
+        // Color emoji (emoji.rs): only when the document has emoji.
+        "d2d1.dll",
+        "dwrite.dll",
     ] {
         println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}");
     }

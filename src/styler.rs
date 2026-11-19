@@ -471,4 +471,239 @@ fn main() { ".encode_utf16().count() as u32;
         assert!(flags_at(&a, pos) & fl::STRONG != 0);
         assert!(flags_at(&a, pos) & fl::MARKER == 0);
     }
+
+    /// UTF-16 position of the `nth` occurrence of `needle` in `t`.
+    fn at(t: &str, needle: &str, nth: usize) -> u32 {
+        let (i, _) = t.match_indices(needle).nth(nth).unwrap_or_else(|| panic!("{needle:?} #{nth} in {t:?}"));
+        t[..i].encode_utf16().count() as u32
+    }
+
+    fn has(a: &Analysis, pos: u32, bits: u32) -> bool {
+        flags_at(a, pos) & bits == bits
+    }
+
+    fn heading_of(a: &Analysis, pos: u32) -> u32 {
+        (flags_at(a, pos) & fl::H_MASK) >> fl::H_SHIFT
+    }
+
+    /// Runs and paragraph runs are contiguous and cover the whole text (UTF-16).
+    fn check_runs(a: &Analysis, t: &str) {
+        let total = t.encode_utf16().count() as u32;
+        let mut pos = 0;
+        for r in &a.runs {
+            assert_eq!(r.start, pos);
+            assert!(r.end > r.start);
+            pos = r.end;
+        }
+        assert_eq!(pos, total);
+        assert_eq!(a.paras.len(), t.split('\n').count());
+        let mut pos = 0;
+        for p in &a.paras {
+            assert_eq!(p.start, pos);
+            assert!(p.end > p.start);
+            pos = p.end;
+        }
+        assert_eq!(pos, total + 1, "the last paragraph run ends one past the text");
+    }
+
+    #[test]
+    fn atx_heading_closing_sequence() {
+        let t = "## Title ##  \n### T\t#\t\n# C#\n";
+        let a = analyze(t, true, None);
+        check_runs(&a, t);
+        assert!(has(&a, 0, fl::MARKER) && has(&a, 2, fl::MARKER), "opening \"## \"");
+        assert!(!has(&a, at(t, "Title", 0), fl::MARKER));
+        assert_eq!(heading_of(&a, at(t, "Title", 0)), 2);
+        // " ##  " is a closing sequence, hidden together with the trailing spaces
+        for p in at(t, " ##", 0)..at(t, "\n", 0) {
+            assert!(has(&a, p, fl::MARKER), "closing sequence at {p}");
+        }
+        // a tab before the closing sequence counts as a separator
+        assert!(has(&a, at(t, "\t#", 0), fl::MARKER) && has(&a, at(t, "#\t", 0), fl::MARKER));
+        assert!(!has(&a, at(t, "T\t", 0), fl::MARKER));
+        assert_eq!(heading_of(&a, at(t, "T\t", 0)), 3);
+        // "C#" is text, not a closing sequence
+        assert!(!has(&a, at(t, "C#", 0) + 1, fl::MARKER));
+        assert_eq!(a.paras.iter().map(|p| p.style.heading).collect::<Vec<_>>(), vec![2, 3, 1, 0]);
+    }
+
+    #[test]
+    fn setext_headings() {
+        let t = "Title\nmore\n=====\n\nSub\n---\n";
+        let a = analyze(t, true, None);
+        check_runs(&a, t);
+        assert_eq!(heading_of(&a, 0), 1);
+        assert!(!has(&a, 0, fl::MARKER), "setext text is visible");
+        assert!(has(&a, at(t, "=", 0), fl::MARKER) && has(&a, at(t, "=", 4), fl::MARKER), "the underline is markup");
+        assert_eq!(heading_of(&a, at(t, "Sub", 0)), 2);
+        assert!(has(&a, at(t, "---", 0), fl::MARKER));
+        // every text line of the heading gets the heading paragraph style, the underline does not
+        assert_eq!(a.paras.iter().map(|p| p.style.heading).collect::<Vec<_>>(), vec![1, 1, 0, 0, 2, 0, 0]);
+    }
+
+    #[test]
+    fn inline_constructs() {
+        let t = "~~s~~ `c` $m$ ![i](p.png) <https://x.y> [](http://e) [^1] <b>h</b>\n\n[^1]: note\n";
+        let a = analyze(t, true, None);
+        check_runs(&a, t);
+        // strikethrough: the tildes are markers
+        assert!(has(&a, 0, fl::STRIKE | fl::MARKER) && has(&a, 4, fl::STRIKE | fl::MARKER));
+        assert!(has(&a, 2, fl::STRIKE) && !has(&a, 2, fl::MARKER));
+        // inline code
+        let c = at(t, "`c`", 0);
+        assert!(has(&a, c, fl::CODE | fl::MARKER) && has(&a, c + 2, fl::CODE | fl::MARKER));
+        assert!(has(&a, c + 1, fl::CODE) && !has(&a, c + 1, fl::MARKER));
+        // math
+        assert!(has(&a, at(t, "$m$", 0) + 1, fl::MATH));
+        // image: alt text is IMAGE, the syntax around is hidden markup with the URL
+        let i = at(t, "![i]", 0);
+        assert!(has(&a, i, fl::MARKER | fl::URL) && has(&a, i + 1, fl::MARKER | fl::URL));
+        assert!(has(&a, i + 2, fl::IMAGE) && !has(&a, i + 2, fl::MARKER));
+        assert!(has(&a, at(t, "p.png", 0), fl::MARKER | fl::URL));
+        // autolink: the address itself is the link text, only the angle brackets are markup
+        let l = at(t, "<https", 0);
+        assert!(has(&a, l, fl::MARKER | fl::URL));
+        assert!(has(&a, l + 1, fl::LINK) && !has(&a, l + 1, fl::MARKER));
+        assert!(has(&a, at(t, "x.y>", 0) + 3, fl::MARKER | fl::URL));
+        // a link without text is all markup
+        let e = at(t, "[](", 0);
+        for p in e..at(t, "http://e)", 0) + 9 {
+            assert!(has(&a, p, fl::MARKER | fl::URL) && !has(&a, p, fl::LINK), "{p}");
+        }
+        // footnote reference and definition label
+        assert!(has(&a, at(t, "[^1]", 0) + 1, fl::FOOTNOTE));
+        let d = at(t, "[^1]:", 0);
+        assert!(has(&a, d, fl::FOOTNOTE) && has(&a, d + 4, fl::FOOTNOTE));
+        assert!(!has(&a, at(t, "note", 0), fl::FOOTNOTE));
+        // inline HTML tags
+        assert!(has(&a, at(t, "<b>", 0), fl::HTML) && has(&a, at(t, "</b>", 0), fl::HTML));
+        assert!(!has(&a, at(t, "h</b>", 0), fl::HTML));
+    }
+
+    #[test]
+    fn image_inside_link() {
+        let t = "[![a](i.png)](http://x)";
+        let a = analyze(t, true, None);
+        check_runs(&a, t);
+        let alt = at(t, "a]", 0);
+        assert!(has(&a, alt, fl::IMAGE | fl::LINK), "the image is the link's content");
+        assert!(has(&a, 0, fl::MARKER | fl::URL), "outer '['");
+        assert!(has(&a, at(t, "](http", 0), fl::MARKER | fl::URL));
+        assert!(has(&a, at(t, "i.png", 0), fl::MARKER | fl::URL | fl::LINK));
+    }
+
+    #[test]
+    fn block_constructs() {
+        let t = "---\ntitle: x\n---\n\n***\n\n<div>\nx\n</div>\n\n| a | b |\n|---|:-:|\n| 1 | \\| |\n\n- [x] done\n- b\n  - c\n\n1. one\n2) two\n";
+        let a = analyze(t, true, None);
+        check_runs(&a, t);
+        assert!(has(&a, at(t, "title", 0), fl::META), "front matter");
+        assert!(has(&a, at(t, "***", 0), fl::HR));
+        assert!(has(&a, at(t, "<div>", 0), fl::HTML) && has(&a, at(t, "</div>", 0), fl::HTML));
+        // table: unescaped pipes, the header and the delimiter row
+        let row = at(t, "| a", 0);
+        assert!(has(&a, row, fl::TABLE | fl::PIPE | fl::THEAD));
+        assert!(has(&a, row + 2, fl::TABLE | fl::THEAD) && !has(&a, row + 2, fl::PIPE));
+        assert!(has(&a, at(t, "|---", 0) + 1, fl::PIPE), "the delimiter row is markup");
+        assert!(has(&a, at(t, ":-:", 0), fl::PIPE));
+        let esc = at(t, "\\|", 0);
+        assert!(has(&a, esc + 1, fl::TABLE) && !has(&a, esc + 1, fl::PIPE), "an escaped pipe is text");
+        assert!(!has(&a, at(t, "| 1", 0) + 2, fl::THEAD));
+        // task list
+        let task = at(t, "- [x]", 0);
+        assert!(has(&a, task, fl::MARKER | fl::LISTMARK) && !has(&a, task, fl::ORDERED));
+        assert!(has(&a, task + 2, fl::TASK));
+        // ordered lists, both delimiters
+        let one = at(t, "1. one", 0);
+        assert!(has(&a, one, fl::MARKER | fl::LISTMARK | fl::ORDERED) && has(&a, one + 2, fl::MARKER | fl::ORDERED));
+        assert!(!has(&a, one + 3, fl::MARKER));
+        assert!(has(&a, at(t, "2)", 0) + 1, fl::MARKER | fl::ORDERED));
+        // paragraph styles: list depth and bullets
+        let line = |s: &str| t[..t.find(s).unwrap()].matches('\n').count();
+        let st = |s: &str| a.paras[line(s)].style;
+        assert_eq!((st("- [x]").list_depth, st("- [x]").bullet), (1, true));
+        assert_eq!((st("  - c").list_depth, st("  - c").bullet), (2, true));
+        assert_eq!((st("1. one").list_depth, st("1. one").bullet), (1, false));
+    }
+
+    #[test]
+    fn code_blocks() {
+        let t = "```py\nx = 1\n```\n\n    indented\n\n~~~\nopen\n~~~\n\n```\nunclosed\n";
+        let a = analyze(t, true, None);
+        check_runs(&a, t);
+        assert!(has(&a, 0, fl::FENCE | fl::MARKER) && has(&a, 4, fl::FENCE | fl::MARKER), "opening fence with the info string");
+        let body = at(t, "x = 1", 0);
+        assert!(has(&a, body, fl::CODEBLOCK) && !has(&a, body, fl::MARKER));
+        assert_eq!(Kind::from_code((flags_at(&a, body + 4) & fl::SYN_MASK) >> fl::SYN_SHIFT), Kind::Num);
+        assert!(has(&a, at(t, "```\n", 1), fl::FENCE | fl::MARKER), "closing fence");
+        // an indented block: code without fences, no highlighting language
+        let ind = at(t, "indented", 0);
+        assert!(has(&a, ind, fl::CODEBLOCK) && !has(&a, ind, fl::FENCE));
+        assert_eq!(flags_at(&a, ind) & fl::SYN_MASK, 0);
+        assert!(has(&a, at(t, "open", 0), fl::CODEBLOCK));
+        assert!(has(&a, at(t, "~~~", 1), fl::FENCE | fl::MARKER));
+        // an unclosed fence runs to the end; its last line is code, not a fence
+        assert!(has(&a, at(t, "unclosed", 0), fl::CODEBLOCK));
+        let line = |s: &str| t[..t.find(s).unwrap()].matches('\n').count();
+        assert!(a.paras[line("x = 1")].style.code && a.paras[line("    indented")].style.code && a.paras[line("unclosed")].style.code);
+        assert!(!a.paras[line("    indented") - 1].style.code, "the blank line between blocks");
+    }
+
+    #[test]
+    fn quote_markers() {
+        let t = "> a\n> > b\n\n  > c\nlazy\n";
+        let a = analyze(t, true, None);
+        check_runs(&a, t);
+        assert!(has(&a, 0, fl::MARKER | fl::QUOTE) && has(&a, 1, fl::MARKER), "\"> \"");
+        assert!(!has(&a, 2, fl::MARKER) && has(&a, 2, fl::QUOTE));
+        let l1 = at(t, "> > b", 0);
+        for p in l1..l1 + 4 {
+            assert!(has(&a, p, fl::MARKER), "nested markers at {p}");
+        }
+        assert!(!has(&a, l1 + 4, fl::MARKER));
+        // up to three leading spaces are skipped (and stay visible), "> " is the marker
+        let l2 = at(t, "  > c", 0);
+        assert!(!has(&a, l2, fl::MARKER) && !has(&a, l2 + 1, fl::MARKER));
+        assert!(has(&a, l2 + 2, fl::MARKER) && has(&a, l2 + 3, fl::MARKER) && !has(&a, l2 + 4, fl::MARKER));
+        // a lazy continuation line belongs to the quote but has no marker
+        let lazy = at(t, "lazy", 0);
+        assert!(has(&a, lazy, fl::QUOTE) && !has(&a, lazy, fl::MARKER));
+        let q: Vec<u8> = a.paras.iter().map(|p| p.style.quote).collect();
+        assert_eq!(q, vec![1, 2, 0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn caret_line_and_modes() {
+        let t = "- **a**\n- b";
+        // visual: the caret line reveals its markers and loses the bullet
+        let a = analyze(t, true, Some(0));
+        assert!(has(&a, 0, fl::MARKER | fl::REVEAL) && has(&a, 2, fl::MARKER | fl::REVEAL));
+        assert!(!a.paras[0].style.bullet && a.paras[1].style.bullet);
+        assert!(!has(&a, at(t, "- b", 0), fl::REVEAL));
+        // a caret line past the end is ignored
+        let b = analyze(t, true, Some(100));
+        assert!(!b.runs.iter().any(|r| r.flags & fl::REVEAL != 0));
+        assert!(b.paras[0].style.bullet);
+        // code mode: no paragraph styles, no reveal, but the same character flags
+        let c = analyze(t, false, Some(0));
+        assert!(c.paras.iter().all(|p| p.style == ParaStyle::default()));
+        assert!(!c.runs.iter().any(|r| r.flags & fl::REVEAL != 0));
+        assert!(has(&c, 2, fl::MARKER | fl::STRONG));
+    }
+
+    #[test]
+    fn empty_and_surrogate_text() {
+        let a = analyze("", true, Some(0));
+        assert!(a.runs.is_empty());
+        assert_eq!(a.paras, vec![ParaRun { start: 0, end: 1, style: ParaStyle::default() }]);
+        let t = "😀 **b**\n# 日本";
+        let a = analyze(t, true, None);
+        check_runs(&a, t);
+        assert!(has(&a, 5, fl::STRONG) && !has(&a, 5, fl::MARKER), "'b' after a surrogate pair");
+        assert_eq!(a.paras[0], ParaRun { start: 0, end: 9, style: ParaStyle::default() });
+        assert_eq!(a.paras[1].style.heading, 1);
+        assert_eq!(a.paras[1].end, t.encode_utf16().count() as u32 + 1);
+    }
+
+    use crate::highlight::Kind;
 }

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, HWND};
 use windows::Win32::System::Registry::*;
-use windows::Win32::UI::Shell::{SHChangeNotify, SHOpenWithDialog, OAIF_FORCE_REGISTRATION, OAIF_REGISTER_EXT, OPENASINFO, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
+use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
 
 use crate::util::{self, pcwstr, wide};
 
@@ -41,6 +41,8 @@ const LEGACY_APP_NAME: &str = "vibe-mdViewer";
 const LEGACY_MARKER: &str = ".vibe-md-installed";
 const APP_KEY: &str = "Software\\VibeMdViewer";
 const UNINSTALL_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\VibeMdViewer";
+/// The name in `Software\RegisteredApplications` (Windows Settings → Default apps).
+const REGISTERED_NAME: &str = "vibe-md-viewer";
 pub const HELP_DOC: &str = "vibe-md-viewer.md";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ERROR_CANCELLED_CODE: u32 = 1223;
@@ -235,13 +237,19 @@ fn has_name(dir: &Path, name: &str) -> bool {
 /// The installed copy: first "for all users", then "for the current user".
 pub fn installed() -> Option<Installed> {
     for scope in [Scope::Machine, Scope::User] {
-        let reg = Reg::for_scope(scope);
-        if let Some(dir) = reg.get_str(APP_KEY, Some("InstallDir")).map(PathBuf::from) {
-            if dir.join(EXE_NAME).exists() || (has_name(&dir, LEGACY_DIR_NAME) && dir.join(LEGACY_EXE_NAME).exists()) {
-                let version = reg.get_str(APP_KEY, Some("Version")).unwrap_or_else(|| "0.0.0".into());
-                return Some(Installed { scope, dir, version });
-            }
+        if let Some(inst) = installed_at(&Reg::for_scope(scope), scope) {
+            return Some(inst);
         }
+    }
+    None
+}
+
+/// The installation registered in `reg`, if its folder still has the program.
+fn installed_at(reg: &Reg, scope: Scope) -> Option<Installed> {
+    let dir = reg.get_str(APP_KEY, Some("InstallDir")).map(PathBuf::from)?;
+    if dir.join(EXE_NAME).exists() || (has_name(&dir, LEGACY_DIR_NAME) && dir.join(LEGACY_EXE_NAME).exists()) {
+        let version = reg.get_str(APP_KEY, Some("Version")).unwrap_or_else(|| "0.0.0".into());
+        return Some(Installed { scope, dir, version });
     }
     None
 }
@@ -444,7 +452,7 @@ pub fn register_at(reg: &Reg, scope: Scope, exe: &Path, dir: &Path) -> Result<()
             reg.set_str(&format!("{classes}\\{ext}"), Some("PerceivedType"), "text")?;
         }
     }
-    reg.set_str("Software\\RegisteredApplications", Some("vibe-md-viewer"), &cap)?;
+    reg.set_str("Software\\RegisteredApplications", Some(REGISTERED_NAME), &cap)?;
     reg.set_str(APP_KEY, Some("InstallDir"), &dir.to_string_lossy())?;
     reg.set_str(APP_KEY, Some("Version"), VERSION)?;
     reg.set_str(APP_KEY, Some("Scope"), if scope == Scope::Machine { "machine" } else { "user" })?;
@@ -472,7 +480,7 @@ pub fn unregister_at(reg: &Reg) {
     }
     reg.delete_tree(&format!("{classes}\\{PROGID}"));
     reg.delete_tree(&format!("{classes}\\Applications\\{EXE_NAME}"));
-    reg.delete_value("Software\\RegisteredApplications", "vibe-md-viewer");
+    reg.delete_value("Software\\RegisteredApplications", REGISTERED_NAME);
     reg.delete_tree(APP_KEY);
     reg.delete_tree(UNINSTALL_KEY);
     unregister_legacy(reg);
@@ -801,7 +809,7 @@ pub fn install_interactive(owner: Option<HWND>) -> Result<Option<Outcome>, Strin
         return Ok(None);
     }
     let Some((dir, scope)) = install_fresh(owner, &dir)? else { return Ok(None) };
-    prompt_default_with_hint(owner, &dir);
+    prompt_default_with_hint(owner);
     Ok(Some(Outcome::Installed { dir, scope }))
 }
 
@@ -827,25 +835,37 @@ pub fn install_fresh(owner: Option<HWND>, dir: &Path) -> Result<Option<(PathBuf,
     }
 }
 
-/// Explanation + the system "Open with" window (choosing the "default program").
-pub fn prompt_default_with_hint(owner: Option<HWND>, dir: &Path) {
+/// Explanation + Windows Settings → Default apps (choosing the "default program").
+pub fn prompt_default_with_hint(owner: Option<HWND>) {
     util::info(
         owner,
         tr!(
-            "Windows will now show the “How do you want to open this file?” window.\n\nSelect “vibe-md-viewer” and check “Always use this app” — then .md files will open with a double-click.",
-            "Сейчас Windows покажет окно «Каким образом вы хотите открыть этот файл?».\n\nВыберите «vibe-md-viewer» и отметьте «Всегда использовать это приложение» — тогда файлы .md будут открываться двойным щелчком."
+            "Windows Settings → Default apps will open now.\n\nWindows 11: on the vibe-md-viewer page, set it for .md.\nWindows 10: click “Choose default apps by file type”, find .md and select vibe-md-viewer.\n\nThen .md files will open with a double-click.",
+            "Сейчас откроются «Параметры Windows → Приложения по умолчанию».\n\nWindows 11: на странице vibe-md-viewer назначьте его для .md.\nWindows 10: нажмите «Выбор стандартных приложений для типов файлов», найдите .md и выберите vibe-md-viewer.\n\nТогда файлы .md будут открываться двойным щелчком."
         ),
     );
-    prompt_default(owner, &dir.join(HELP_DOC));
+    prompt_default(owner);
 }
 
-/// The system "Open with" window with the "Always use" checkbox (in the user's context).
-pub fn prompt_default(owner: Option<HWND>, sample: &Path) {
-    let w = util::wide_path(sample);
-    let info = OPENASINFO { pcszFile: pcwstr(&w), pcszClass: PCWSTR::null(), oaifInFlags: OAIF_REGISTER_EXT | OAIF_FORCE_REGISTRATION };
+/// Windows Settings → Default apps; on Windows 11 right on our app's page
+/// (`registeredAppMachine`/`registeredAppUser` = our RegisteredApplications name; Windows 10
+/// ignores the parameter and opens the general page). Windows doesn't let apps make themselves
+/// the default silently — the user chooses there. The old SHOpenWithDialog didn't show up when
+/// called from our window and left a hidden OpenWith.exe process behind on every click.
+pub fn prompt_default(owner: Option<HWND>) {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let uri = wide(&settings_uri(installed().map(|i| i.scope).unwrap_or(Scope::Machine)));
+    let verb = wide("open");
     unsafe {
-        let _ = SHOpenWithDialog(owner, &info);
+        ShellExecuteW(owner, pcwstr(&verb), pcwstr(&uri), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
     }
+}
+
+/// The Settings page with our app's default-app choices (see prompt_default).
+fn settings_uri(scope: Scope) -> String {
+    let key = if scope == Scope::Machine { "registeredAppMachine" } else { "registeredAppUser" };
+    format!("ms-settings:defaultapps?{key}={REGISTERED_NAME}")
 }
 
 pub fn uninstall_interactive(owner: Option<HWND>) -> Result<bool, String> {
@@ -940,10 +960,347 @@ mod tests {
         }
     }
 
+    /// A fresh folder name under .toolcache\tmp (unique per process: several test runs may overlap).
     fn test_dir(name: &str) -> PathBuf {
-        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".toolcache").join("tmp").join(name);
+        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".toolcache").join("tmp").join(format!("{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         d
+    }
+
+    /// A temporary registry branch HKCU\Software\VibeMdViewer-Test-<pid>-<name>\ (delete with `drop_test_reg`).
+    fn test_reg(name: &str) -> (Reg, String) {
+        let base = format!("Software\\VibeMdViewer-Test-{}-{name}", std::process::id());
+        (Reg { root: HKEY_CURRENT_USER, prefix: format!("{base}\\") }, base)
+    }
+
+    fn drop_test_reg(base: &str) {
+        let root = Reg { root: HKEY_CURRENT_USER, prefix: String::new() };
+        root.delete_tree(base);
+        assert!(root.get_str(base, None).is_none() && root.get_str(&format!("{base}\\{APP_KEY}"), Some("InstallDir")).is_none());
+    }
+
+    fn get_dword(reg: &Reg, sub: &str, name: &str) -> Option<u32> {
+        let ws = wide(&reg.p(sub));
+        let wn = wide(name);
+        let mut v = 0u32;
+        let mut size = 4u32;
+        let r = unsafe { RegGetValueW(reg.root, pcwstr(&ws), pcwstr(&wn), RRF_RT_REG_DWORD, None, Some(&mut v as *mut u32 as *mut core::ffi::c_void), Some(&mut size)) };
+        (r == ERROR_SUCCESS).then_some(v)
+    }
+
+    #[test]
+    fn version_edge_cases() {
+        for (s, v) in [
+            ("", (0, 0, 0)),
+            ("garbage", (0, 0, 0)),
+            ("1", (1, 0, 0)),
+            ("1.2", (1, 2, 0)),
+            (" 1.2.3 \n", (1, 2, 3)),
+            ("1.2.3+build.5", (1, 2, 3)),
+            ("1.2.3.4", (1, 2, 3)),
+            ("1..3", (1, 0, 3)),
+            ("v1.2.3", (0, 2, 3)),
+            ("4294967296.1.1", (0, 1, 1)),
+            ("4294967295.0.0", (u32::MAX, 0, 0)),
+        ] {
+            assert_eq!(parse_version(s), v, "{s:?}");
+        }
+        assert_eq!(compare_versions("1.2.3-beta", "1.2.3"), Ordering::Equal, "pre-release tags are ignored");
+        assert_eq!(compare_versions("garbage", "0.0.1"), Ordering::Less);
+        assert_eq!(compare_versions("10.0.0", "9.99.99"), Ordering::Greater, "numeric, not lexicographic");
+        assert_eq!(compare_versions(VERSION, VERSION), Ordering::Equal);
+        assert_ne!(parse_version(VERSION), (0, 0, 0), "the crate version parses");
+    }
+
+    #[test]
+    fn scopes() {
+        assert_eq!(Scope::Machine.root(), HKEY_LOCAL_MACHINE);
+        assert_eq!(Scope::User.root(), HKEY_CURRENT_USER);
+        assert_eq!(Scope::Machine.label(), "for all users");
+        assert_eq!(Scope::User.label(), "for the current user only");
+        let r = Reg::for_scope(Scope::User);
+        assert_eq!((r.root, r.prefix.as_str()), (HKEY_CURRENT_USER, ""));
+        assert_eq!(r.p(APP_KEY), APP_KEY);
+        let (t, base) = test_reg("prefix");
+        assert_eq!(t.p("Software\\X"), format!("{base}\\Software\\X"));
+        assert!(program_files().is_absolute());
+        assert_eq!(Scope::Machine.default_dir(), program_files().join(DIR_NAME));
+        let user = Scope::User.default_dir();
+        assert!(user.ends_with(Path::new("Programs").join(DIR_NAME)), "{}", user.display());
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            assert_eq!(user, PathBuf::from(local).join("Programs").join(DIR_NAME));
+        }
+    }
+
+    #[test]
+    fn install_dir_shape_edge_cases() {
+        for ok in ["D:\\Apps\\vibe-md-viewer", "D:\\Apps\\VIBE-MD-VIEWER", "D:\\vibe-md-viewer", "C:\\Program Files (x86)\\vibe-md-viewer"] {
+            assert!(validate_install_dir(Path::new(ok)).is_ok(), "{ok}");
+        }
+        let err = |p: &str| validate_install_dir(Path::new(p)).unwrap_err();
+        assert!(err("D:\\Apps\\..\\vibe-md-viewer").contains("“..”"));
+        assert!(err(".\\vibe-md-viewer").contains("“..”"), "a leading . is a CurDir component");
+        for bad in ["D:\\100%\\vibe-md-viewer", "D:\\a!b\\vibe-md-viewer", "D:\\Apps\\vibe-md-viewer\\", "D:\\a\"b\\vibe-md-viewer"] {
+            assert!(err(bad).contains("invalid characters"), "{bad}");
+        }
+        for bad in ["vibe-md-viewer", "C:vibe-md-viewer", "\\Apps\\vibe-md-viewer", "\\\\?\\C:\\Apps\\vibe-md-viewer", "\\\\server\\share\\vibe-md-viewer"] {
+            assert!(err(bad).contains("local absolute path"), "{bad}");
+        }
+        for bad in ["D:\\Apps\\vibe-md-viewer.exe", "D:\\Apps\\vibe-md-viewer2", "D:\\Apps\\vibe-mdViewer"] {
+            assert!(err(bad).contains("must be named vibe-md-viewer"), "{bad}");
+        }
+        if let Some(win) = std::env::var_os("SystemRoot") {
+            let p = PathBuf::from(win).join("Temp").join(DIR_NAME);
+            assert!(validate_install_dir(&p).unwrap_err().contains("Windows system folder"), "{}", p.display());
+        }
+        // The former name is accepted only where a 0.1.x installation is recognized (uninstall/migration).
+        assert!(validate_dir_shape(Path::new("D:\\Apps\\vibe-mdViewer"), &[DIR_NAME, LEGACY_DIR_NAME]).is_ok());
+    }
+
+    #[test]
+    fn names_and_same_dir() {
+        assert!(has_name(Path::new("C:\\x\\Vibe-MD-Viewer"), DIR_NAME));
+        assert!(!has_name(Path::new("C:\\"), DIR_NAME), "a drive root has no name");
+        assert!(!has_name(Path::new("C:\\x\\vibe-md-viewer.exe"), DIR_NAME));
+        assert!(same_dir(Path::new("C:\\A\\\\"), Path::new("c:\\a")), "trailing separators are ignored");
+        assert!(!same_dir(Path::new("C:\\A"), Path::new("C:\\B")));
+        assert!(!same_dir(Path::new("C:\\A\\vibe"), Path::new("C:\\A\\vibe-md-viewer")));
+        let pf = Installed { scope: Scope::Machine, dir: program_files().join(DIR_NAME), version: "0.2.0".into() };
+        assert!(!pf.is_legacy());
+        assert_eq!(pf.target_dir(), pf.dir);
+        let user_legacy = Installed { scope: Scope::User, dir: PathBuf::from("D:\\Tools\\VIBE-MDVIEWER"), version: "0.1.0".into() };
+        assert!(user_legacy.is_legacy(), "case-insensitive");
+        assert_eq!(user_legacy.target_dir(), Scope::User.default_dir());
+    }
+
+    #[test]
+    fn rename_note_only_for_legacy_installs() {
+        let cur = Installed { scope: Scope::User, dir: Scope::User.default_dir(), version: "0.2.0".into() };
+        assert_eq!(rename_note(&cur), "");
+        let old = Installed { scope: Scope::User, dir: PathBuf::from("D:\\Tools\\vibe-mdViewer"), version: "0.1.3".into() };
+        let note = rename_note(&old);
+        assert!(note.starts_with("\n\nThe program is now called vibe-md-viewer"), "{note}");
+        assert!(note.contains(&Scope::User.default_dir().display().to_string()), "{note}");
+    }
+
+    #[test]
+    fn our_install_dir_needs_marker_and_exe() {
+        let root = test_dir("ours-test");
+        let dir = root.join(DIR_NAME);
+        fs::create_dir_all(&dir).unwrap();
+        assert!(!is_our_install_dir(&dir), "empty folder");
+        fs::write(dir.join(MARKER), b"m").unwrap();
+        assert!(!is_our_install_dir(&dir), "marker without the program");
+        fs::write(dir.join(EXE_NAME), b"exe").unwrap();
+        assert!(is_our_install_dir(&dir));
+        assert!(may_delete(Scope::User, &dir));
+        assert!(!may_delete(Scope::Machine, &dir), "not directly in Program Files");
+        // The same folder reached through ".." is refused by the path shape check.
+        let indirect = root.join("x").join("..").join(DIR_NAME);
+        assert!(!is_our_install_dir(&indirect));
+        assert!(schedule_dir_delete(&indirect, 1).is_err(), "nothing is started for a foreign path");
+        // Program without the marker → not ours.
+        fs::remove_file(dir.join(MARKER)).unwrap();
+        assert!(!is_our_install_dir(&dir));
+        let e = schedule_dir_delete(&dir, 1).unwrap_err();
+        assert!(e.contains("is not the program's installation folder"), "{e}");
+        // A former marker with the new exe also counts (partially migrated installation).
+        fs::write(dir.join(LEGACY_MARKER), b"m").unwrap();
+        assert!(is_our_install_dir(&dir));
+        assert!(!may_delete(Scope::Machine, Path::new("C:\\nonexistent\\vibe-md-viewer")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_files_edge_cases() {
+        let root = test_dir("install-edge-test");
+        let dir = root.join(DIR_NAME);
+        let e = install_files(&root.join("missing.exe"), &dir).unwrap_err();
+        assert!(e.starts_with("Could not open"), "{e}");
+        assert!(!dir.exists());
+
+        // A stale .old copy from an earlier update is replaced and then removed.
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(EXE_NAME), b"old version").unwrap();
+        fs::write(dir.join(OLD_EXE_NAME), b"stale").unwrap();
+        let src = root.join("new.exe");
+        fs::write(&src, b"new version").unwrap();
+        install_files(&src, &dir).unwrap();
+        assert_eq!(fs::read(dir.join(EXE_NAME)).unwrap(), b"new version");
+        assert!(!dir.join(OLD_EXE_NAME).exists());
+        assert_eq!(fs::read_to_string(dir.join(MARKER)).unwrap(), format!("vibe-md-viewer {VERSION}\n"));
+        let help = fs::read_to_string(dir.join(HELP_DOC)).unwrap();
+        assert!(help.contains(&format!("Version {VERSION}.")) && !help.contains("{{STATUS}}"));
+
+        // Installing the installed exe over itself (same file): nothing is copied or renamed.
+        fs::remove_file(dir.join(MARKER)).unwrap();
+        install_files(&dir.join(EXE_NAME), &dir).unwrap();
+        assert_eq!(fs::read(dir.join(EXE_NAME)).unwrap(), b"new version");
+        assert!(!dir.join(OLD_EXE_NAME).exists() && dir.join(MARKER).exists());
+
+        // An invalid folder is refused before anything is created.
+        let bad = root.join("x").join("..").join(DIR_NAME);
+        assert!(install_files(&src, &bad).is_err());
+        assert!(!root.join("x").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The copy fails (the source handle cannot be read): the installed program is restored.
+    #[test]
+    fn failed_copy_rolls_back() {
+        let root = test_dir("rollback-test");
+        let src_path = root.join("src.exe");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&src_path, b"new version").unwrap();
+        let write_only = || fs::OpenOptions::new().write(true).open(&src_path).unwrap();
+
+        let dir = root.join("upd").join(DIR_NAME);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(EXE_NAME), b"installed").unwrap();
+        let e = install_files_from(&mut write_only(), &dir).unwrap_err();
+        assert!(e.starts_with("Could not copy the program"), "{e}");
+        assert_eq!(fs::read(dir.join(EXE_NAME)).unwrap(), b"installed", "the previous exe is put back");
+        assert!(!dir.join(OLD_EXE_NAME).exists() && !dir.join(MARKER).exists());
+
+        // Fresh folder: no half-written exe is left behind.
+        let fresh = root.join("new").join(DIR_NAME);
+        assert!(install_files_from(&mut write_only(), &fresh).is_err());
+        assert!(!fresh.join(EXE_NAME).exists() && !fresh.join(MARKER).exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn installed_from_registry() {
+        let (reg, base) = test_reg("installed");
+        let root = test_dir("installed-test");
+        assert!(installed_at(&reg, Scope::User).is_none(), "no registration");
+
+        // Registered, but the folder has no program (removed by hand) → not installed.
+        let dir = root.join(DIR_NAME);
+        fs::create_dir_all(&dir).unwrap();
+        reg.set_str(APP_KEY, Some("InstallDir"), &dir.to_string_lossy()).unwrap();
+        assert!(installed_at(&reg, Scope::User).is_none());
+
+        fs::write(dir.join(EXE_NAME), b"exe").unwrap();
+        let i = installed_at(&reg, Scope::User).expect("installed");
+        assert_eq!((i.scope, i.dir.as_path(), i.version.as_str()), (Scope::User, dir.as_path(), "0.0.0"), "no Version value");
+        reg.set_str(APP_KEY, Some("Version"), "0.1.7").unwrap();
+        assert_eq!(installed_at(&reg, Scope::Machine).unwrap().version, "0.1.7");
+
+        // 0.1.x: the former folder name with the former exe name.
+        let legacy = root.join(LEGACY_DIR_NAME);
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join(LEGACY_EXE_NAME), b"old").unwrap();
+        reg.set_str(APP_KEY, Some("InstallDir"), &legacy.to_string_lossy()).unwrap();
+        let i = installed_at(&reg, Scope::User).expect("legacy install");
+        assert!(i.is_legacy());
+        // The former exe name in a folder with another name does not count.
+        let other = root.join("Other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join(LEGACY_EXE_NAME), b"old").unwrap();
+        reg.set_str(APP_KEY, Some("InstallDir"), &other.to_string_lossy()).unwrap();
+        assert!(installed_at(&reg, Scope::User).is_none());
+
+        drop_test_reg(&base);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn registry_values_and_errors() {
+        let (reg, base) = test_reg("values");
+        // Default value, named value, empty and non-ASCII strings.
+        reg.set_str("K", None, "default").unwrap();
+        reg.set_str("K", Some("name"), "Значение ✓").unwrap();
+        reg.set_str("K", Some("empty"), "").unwrap();
+        assert_eq!(reg.get_str("K", None).as_deref(), Some("default"));
+        assert_eq!(reg.get_str("K", Some("name")).as_deref(), Some("Значение ✓"));
+        assert_eq!(reg.get_str("K", Some("empty")).as_deref(), Some(""));
+        assert_eq!(reg.get_str("K", Some("missing")), None);
+        assert_eq!(reg.get_str("Missing", None), None);
+        // A DWORD is not read as a string.
+        reg.set_dword("K", "n", 42).unwrap();
+        assert_eq!(get_dword(&reg, "K", "n"), Some(42));
+        assert_eq!(reg.get_str("K", Some("n")), None);
+        reg.delete_value("K", "name");
+        assert_eq!(reg.get_str("K", Some("name")), None);
+        reg.delete_value("K", "never-existed");
+        reg.delete_tree("Missing\\Deeper");
+
+        // A key name component over 255 characters cannot be created.
+        let long = "k".repeat(300);
+        let e = reg.set_str(&long, None, "x").unwrap_err();
+        assert!(e.starts_with("Could not write to the registry") && e.contains(&base), "{e}");
+        assert!(reg.set_dword(&long, "n", 1).is_err());
+        // A value name over 16383 characters cannot be written.
+        let huge = "v".repeat(20000);
+        assert!(reg.set_str("K", Some(&huge), "x").unwrap_err().starts_with("Could not write to the registry"));
+        assert!(reg.set_dword("K", &huge, 1).unwrap_err().starts_with("Could not write to the registry"));
+
+        reg.delete_tree("K");
+        assert_eq!(reg.get_str("K", None), None);
+        drop_test_reg(&base);
+    }
+
+    #[test]
+    fn registry_register_for_current_user() {
+        let (reg, base) = test_reg("user");
+        let root = test_dir("register-user-test");
+        let dir = root.join(DIR_NAME);
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join(EXE_NAME);
+        fs::write(&exe, vec![0u8; 5000]).unwrap();
+        let classes = "Software\\Classes";
+        // An empty default value means "nobody" → taken; an existing Content Type is kept.
+        reg.set_str(&format!("{classes}\\.mkd"), None, "").unwrap();
+        reg.set_str(&format!("{classes}\\.md"), Some("Content Type"), "text/x-custom").unwrap();
+
+        register_at(&reg, Scope::User, &exe, &dir).unwrap();
+        assert_eq!(reg.get_str(APP_KEY, Some("Scope")).as_deref(), Some("user"));
+        assert_eq!(reg.get_str(APP_KEY, Some("InstallDir")).as_deref(), Some(&*dir.to_string_lossy()));
+        assert_eq!(get_dword(&reg, UNINSTALL_KEY, "EstimatedSize"), Some(4), "5000 bytes → 4 KB");
+        assert_eq!(get_dword(&reg, UNINSTALL_KEY, "NoModify"), Some(1));
+        assert_eq!(get_dword(&reg, UNINSTALL_KEY, "NoRepair"), Some(1));
+        let exe_s = exe.to_string_lossy();
+        assert_eq!(reg.get_str(UNINSTALL_KEY, Some("UninstallString")), Some(format!("\"{exe_s}\" --uninstall")));
+        assert_eq!(reg.get_str(&format!("{classes}\\{PROGID}\\shell\\edit\\command"), None), Some(format!("\"{exe_s}\" --mode visual \"%1\"")));
+        assert_eq!(reg.get_str(&format!("{classes}\\{PROGID}\\DefaultIcon"), None), Some(format!("\"{exe_s}\",0")));
+        assert_eq!(reg.get_str(&format!("{classes}\\.mkd"), None).as_deref(), Some(PROGID));
+        assert_eq!(reg.get_str(&format!("{classes}\\.md"), Some("Content Type")).as_deref(), Some("text/x-custom"));
+        assert_eq!(reg.get_str(&format!("{classes}\\.mdwn"), Some("Content Type")).as_deref(), Some("text/markdown"));
+        assert_eq!(reg.get_str(&format!("{classes}\\.mdwn"), Some("PerceivedType")).as_deref(), Some("text"));
+        for ext in EXTS {
+            assert_eq!(reg.get_str(&format!("{APP_KEY}\\Capabilities\\FileAssociations"), Some(ext)).as_deref(), Some(PROGID), "{ext}");
+            assert!(reg.get_str(&format!("{classes}\\Applications\\{EXE_NAME}\\SupportedTypes"), Some(ext)).is_some(), "{ext}");
+        }
+        let i = installed_at(&reg, Scope::User).expect("registered and present");
+        assert_eq!((i.dir.as_path(), i.version.as_str()), (dir.as_path(), VERSION));
+
+        unregister_at(&reg);
+        assert!(installed_at(&reg, Scope::User).is_none());
+        assert_eq!(reg.get_str(&format!("{classes}\\.mkd"), None).as_deref(), Some(""), "our default is cleared");
+        assert!(reg.get_str(&format!("{classes}\\Applications\\{EXE_NAME}\\shell\\open\\command"), None).is_none());
+        drop_test_reg(&base);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn process_state_without_side_effects() {
+        // Tests run from target\...\deps: no installer marker next to the exe.
+        assert!(!running_installed());
+        assert_eq!(is_elevated(), is_elevated());
+        // Without administrator rights the elevated entry point refuses at once (no UI, no changes).
+        if !is_elevated() {
+            assert_eq!(elevated_main("not-an-operation", None), 5);
+        }
+    }
+
+    #[test]
+    fn cleanup_old_removes_the_leftover_copy() {
+        let old = util::exe_dir().unwrap().join(OLD_EXE_NAME);
+        fs::write(&old, b"old").unwrap();
+        cleanup_old();
+        assert!(!old.exists());
+        cleanup_old(); // nothing to remove — no error
     }
 
     #[test]
@@ -1050,7 +1407,10 @@ mod tests {
         unregister_legacy(&reg); // as in do_install
         assert!(reg.get_str(&format!("{classes}\\Applications\\{LEGACY_EXE_NAME}\\shell\\open\\command"), None).is_none(), "the old name is removed from \"Open with\"");
         assert!(reg.get_str("Software\\RegisteredApplications", Some(LEGACY_APP_NAME)).is_none());
-        assert!(reg.get_str("Software\\RegisteredApplications", Some("vibe-md-viewer")).is_some());
+        assert!(reg.get_str("Software\\RegisteredApplications", Some(REGISTERED_NAME)).is_some());
+        // "Make default" opens Settings right on this app (Windows 11 deep link).
+        assert_eq!(settings_uri(Scope::Machine), "ms-settings:defaultapps?registeredAppMachine=vibe-md-viewer");
+        assert_eq!(settings_uri(Scope::User), "ms-settings:defaultapps?registeredAppUser=vibe-md-viewer");
         assert!(reg.get_str(&format!("{classes}\\Applications\\{EXE_NAME}\\shell\\open\\command"), None).is_some());
         assert_eq!(
             reg.get_str(&format!("{classes}\\{PROGID}\\shell\\open\\command"), None).as_deref(),

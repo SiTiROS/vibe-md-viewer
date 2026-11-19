@@ -339,7 +339,7 @@ fn do_install() {
         Ok(Some(dir)) => {
             set_busy(true, tr!("Done.", "Готово."));
             if want_default {
-                install::prompt_default_with_hint(owner, &dir);
+                install::prompt_default_with_hint(owner);
             }
             let what = if mode == SMode::Fresh { tr!("installed", "установлен") } else { tr!("updated", "обновлён") };
             util::info(owner, &trf!("vibe-md-viewer {VERSION} has been {what}.\n\n{}", "vibe-md-viewer {VERSION} {what}.\n\n{}", dir.display()));

@@ -38,6 +38,9 @@ pub fn welcome_md() -> &'static str {
 
 const WM_APP_IMG: u32 = WM_APP + 1;
 const WM_APP_RESTYLE: u32 = WM_APP + 2;
+/// Create the color emoji renderer after the first paint and repaint the view (see paint_emoji).
+/// (WM_APP + 3 is ui::WM_BAR_HINT.)
+const WM_APP_EMOJI: u32 = WM_APP + 4;
 
 const T_PREVIEW: usize = 1;
 const T_RESIZE: usize = 2;
@@ -213,6 +216,12 @@ struct ViewState {
     /// the layout it was computed for (see paint_chips).
     chip_geo: HashMap<usize, Vec<[i32; 4]>>,
     chip_key: [i32; 7],
+    /// Emoji clusters in the text (positions and the cluster's UTF-16 text) for the color overlay,
+    /// their geometry (index → x0, x1, baseline in document coordinates, size in px; None —
+    /// not on screen, e.g. hidden text) and the layout it was computed for (see paint_emoji).
+    emoji: Vec<(i32, i32, Box<[u16]>)>,
+    emoji_geo: HashMap<usize, Option<(i32, i32, i32, f32)>>,
+    emoji_key: [i32; 7],
     /// Ready images and captions whose document chunks are not loaded yet.
     pending_picts: Vec<(usize, Rc<String>)>,
     pending_unhide: Vec<usize>,
@@ -267,6 +276,18 @@ pub struct App {
     zoom_acc: Cell<i32>,
     /// Color/opacity of the inline `code` background (drawn over the view text).
     chip_brush: Cell<(u32, u8)>,
+    /// Color emoji renderer: created on the first paint of a document with emoji;
+    /// Some(None) — Direct2D/DirectWrite unavailable, the view keeps RichEdit's outlines.
+    emoji_painter: RefCell<Option<Option<crate::emoji::Painter>>>,
+    /// WM_APP_EMOJI has been posted (the renderer is being created after the first paint).
+    emoji_posted: Cell<bool>,
+    /// Smooth scrolling frames drawn so far (by the message loop and the fallback timer; for the self-test).
+    smooth_frames: Cell<u32>,
+    /// The user's answer about images from the internet, per document, for this run:
+    /// true — "Load" (load them again on every re-render), false — dismissed with ✕
+    /// (don't ask again for this document). Without it the bar came back on every
+    /// re-render (theme, width, zoom, back from an editing mode).
+    remote_choice: RefCell<HashMap<PathBuf, bool>>,
 }
 
 thread_local! {
@@ -432,6 +453,10 @@ pub fn run(opts: Options) -> i32 {
         drag_anchor: Cell::new(None),
         zoom_acc: Cell::new(0),
         chip_brush: Cell::new((0, 0)),
+        emoji_painter: RefCell::new(None),
+        emoji_posted: Cell::new(false),
+        smooth_frames: Cell::new(0),
+        remote_choice: RefCell::new(HashMap::new()),
     });
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
 
@@ -608,11 +633,14 @@ fn key_down(vk: VIRTUAL_KEY) -> bool {
 
 /// Global hotkeys. true means handled.
 fn handle_key(msg: &MSG) -> bool {
+    handle_key_with(msg, key_down(VK_CONTROL), key_down(VK_SHIFT), key_down(VK_MENU))
+}
+
+/// The hotkeys with the modifier state passed in (the self-test presses combinations this way
+/// without touching the real keyboard).
+fn handle_key_with(msg: &MSG, ctrl: bool, shift: bool, alt: bool) -> bool {
     let Some(app) = app() else { return false };
     let vk = VIRTUAL_KEY(msg.wParam.0 as u16);
-    let ctrl = key_down(VK_CONTROL);
-    let shift = key_down(VK_SHIFT);
-    let alt = key_down(VK_MENU);
     let in_src = !app.src().0.is_null() && msg.hwnd == app.src();
     let in_view = msg.hwnd == app.view;
     let mode = app.mode.get();
@@ -661,7 +689,8 @@ fn handle_key(msg: &MSG) -> bool {
             _ => {}
         }
     }
-    if (in_src || in_view) && ((ctrl && (vk == VK_C || vk == VK_INSERT)) || (ctrl && vk == VK_X) || (shift && vk == VK_DELETE)) {
+    // Ctrl+X without Shift: Ctrl+Shift+X is strikethrough (it used to be taken as Cut here).
+    if (in_src || in_view) && ((ctrl && (vk == VK_C || vk == VK_INSERT)) || (ctrl && !shift && vk == VK_X) || (shift && vk == VK_DELETE)) {
         let cut = (ctrl && vk == VK_X) || (shift && vk == VK_DELETE);
         app.copy_selection(if in_src { app.src() } else { app.view }, cut && in_src);
         return true;
@@ -839,6 +868,11 @@ unsafe fn main_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             app.restyle_now();
             LRESULT(0)
         }
+        WM_APP_EMOJI => {
+            app.ensure_emoji_painter();
+            let _ = InvalidateRect(Some(app.view), None, false);
+            LRESULT(0)
+        }
         ui::WM_BAR_HINT => {
             let id = wp.0 as u16;
             let h = if id == 0 { String::new() } else { ui::hint_for(app.bar, id).or_else(|| ui::hint_for(app.info, id)).unwrap_or_default() };
@@ -927,6 +961,15 @@ unsafe fn main_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             LRESULT(0)
         }
         WM_DESTROY => {
+            // Direct2D/DirectWrite objects are released now, while their DLLs are loaded: the
+            // service modes (--selftest, --profile) return with the App still in thread-local
+            // storage, and releasing them at process exit, after d2d1.dll has been detached,
+            // ends in a fail-fast in ntdll (0xC000000D).
+            if let Some(a) = self::app() {
+                if let Ok(mut p) = a.emoji_painter.try_borrow_mut() {
+                    p.take();
+                }
+            }
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -963,6 +1006,7 @@ unsafe fn view_proc_msg(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT
             if kind != NULLREGION && kind != RGN_ERROR {
                 if let Some(app) = app() {
                     app.paint_chips(hwnd, rgn);
+                    app.paint_emoji(hwnd, rgn);
                 }
             }
             PAINT_T.with(|p| {
@@ -1940,6 +1984,9 @@ impl App {
 
         // Images
         let policy = self.settings.borrow().remote_images;
+        let choice = self.doc.borrow().path.as_ref().and_then(|p| self.remote_choice.borrow().get(p).copied());
+        let allow_remote = policy == RemoteImages::Always || choice == Some(true);
+        let ask_remote = policy == RemoteImages::Ask && choice.is_none();
         let max_w = width_px.max(64) as u32;
         let mut immediate: Vec<(usize, Rc<String>)> = Vec::new();
         let mut unhide: Vec<usize> = Vec::new();
@@ -1952,9 +1999,9 @@ impl App {
             match images::resolve(&img.src, base.as_deref()) {
                 Ok(src) => {
                     let remote = matches!(src, Source::Remote(_));
-                    if remote && policy != RemoteImages::Always {
+                    if remote && !allow_remote {
                         unhide.push(img.id);
-                        if policy == RemoteImages::Ask {
+                        if ask_remote {
                             self.vs.borrow_mut().remote_waiting.push(img.id);
                         }
                         continue;
@@ -2227,6 +2274,7 @@ impl App {
         if !sm.active {
             return;
         }
+        self.smooth_frames.set(self.smooth_frames.get().wrapping_add(1));
         let now = std::time::Instant::now();
         let dt = sm.last.map(|t| (now - t).as_secs_f64()).unwrap_or(0.016).clamp(0.001, 0.05);
         sm.last = Some(now);
@@ -2266,6 +2314,13 @@ impl App {
             }
             return;
         }
+        let dy = self.wheel_step(ctl, delta as f64 / 120.0);
+        self.smooth_scroll_by(ctl, dy);
+    }
+
+    /// Scroll distance in pixels for `notches` wheel notches (positive — away from the user, i.e. up):
+    /// the Windows "lines per notch" setting, or a page when it is set to "one screen".
+    fn wheel_step(&self, ctl: HWND, notches: f64) -> f64 {
         let mut lines: u32 = 3;
         unsafe {
             let _ = SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, Some(&mut lines as *mut u32 as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
@@ -2277,9 +2332,11 @@ impl App {
             }
             (rc.bottom as f64 * 0.9).max(40.0)
         };
-        let notches = delta as f64 / 120.0;
-        let dy = if lines == u32::MAX { -notches * page } else { -notches * lines.clamp(1, 20) as f64 * self.line_px(ctl) };
-        self.smooth_scroll_by(ctl, dy);
+        if lines == u32::MAX {
+            -notches * page
+        } else {
+            -notches * lines.clamp(1, 20) as f64 * self.line_px(ctl)
+        }
     }
 
     // ---------------- inline `code` background ----------------
@@ -2410,6 +2467,116 @@ impl App {
         }
         Some(out)
     }
+
+    /// Color emoji on top of RichEdit's monochrome ones (emoji.rs), only in the updated region.
+    /// Geometry is cached in document coordinates the same way as for the chips.
+    fn paint_emoji(&self, hwnd: HWND, rgn: HRGN) {
+        let items = {
+            let Ok(mut v) = self.vs.try_borrow_mut() else { return };
+            if v.emoji.is_empty() {
+                return;
+            }
+            let mut bx = RECT::default();
+            unsafe {
+                GetRgnBox(rgn, &mut bx);
+            }
+            let fr = richedit::get_rect(hwnd);
+            let zoom = richedit::get_zoom(hwnd) as i32;
+            let key = [fr.left, fr.top, fr.right, fr.bottom, zoom, richedit::text_len(hwnd), max_scroll(hwnd) as i32];
+            if v.emoji_key != key {
+                v.emoji_geo.clear();
+                v.emoji_key = key;
+            }
+            let sy = richedit::scroll_pos(hwnd).1;
+            let cp_a = richedit::char_from_pos(hwnd, fr.left + 1, (bx.top - 60).max(0)) - 400;
+            let cp_b = richedit::char_from_pos(hwnd, fr.right - 1, bx.bottom + 60) + 400;
+            let first = v.emoji.partition_point(|c| c.1 < cp_a);
+            let mut doc: Option<ITextDocument> = None;
+            let mut items: Vec<(usize, i32, i32, i32, f32)> = Vec::new();
+            for i in first..v.emoji.len().min(first + 2000) {
+                let (s, e, _) = v.emoji[i];
+                if s > cp_b {
+                    break;
+                }
+                if !v.emoji_geo.contains_key(&i) {
+                    if doc.is_none() {
+                        doc = self.view_doc();
+                    }
+                    let Some(d) = doc.as_ref() else { break };
+                    let g = self.emoji_geometry(d, s, e, sy);
+                    v.emoji_geo.insert(i, g);
+                }
+                if let Some((x0, x1, base, px)) = v.emoji_geo[&i] {
+                    let b = base - sy;
+                    // The glyph reaches about one em above and half an em below the baseline.
+                    if b + px as i32 >= bx.top && b - 2 * px as i32 <= bx.bottom {
+                        items.push((i, x0, x1, b, px));
+                    }
+                }
+            }
+            items
+        };
+        if items.is_empty() {
+            return;
+        }
+        // Direct2D/DirectWrite and the emoji font take ~40 ms to load: not on the way to the
+        // first picture. This paint keeps RichEdit's outlines; the renderer is created right
+        // after it (WM_APP_EMOJI), and the view is repainted in color.
+        if self.emoji_painter.try_borrow().map(|p| p.is_none()).unwrap_or(false) {
+            if !self.emoji_posted.replace(true) {
+                unsafe {
+                    let _ = PostMessageW(Some(self.hwnd), WM_APP_EMOJI, WPARAM(0), LPARAM(0));
+                }
+            }
+            return;
+        }
+        let Ok(mut painter) = self.emoji_painter.try_borrow_mut() else { return };
+        let Some(Some(p)) = painter.as_mut() else { return };
+        let fg = self.theme.get().fg;
+        let Ok(v) = self.vs.try_borrow() else { return };
+        unsafe {
+            let hdc = GetDC(Some(hwnd));
+            let _ = SelectClipRgn(hdc, Some(rgn));
+            for (i, x0, x1, base, px) in items {
+                p.paint(hdc, &v.emoji[i].2, px, fg, x0, x1, base);
+            }
+            ReleaseDC(Some(hwnd), hdc);
+        }
+    }
+
+    /// Creates the color emoji renderer (once; None stays None if Direct2D is unavailable).
+    fn ensure_emoji_painter(&self) {
+        if let Ok(mut p) = self.emoji_painter.try_borrow_mut() {
+            p.get_or_insert_with(crate::emoji::Painter::new);
+        }
+    }
+
+    /// An emoji cluster [s, e): its advance in window x, the baseline in document coordinates
+    /// (y + scroll `sy`) and the font size in pixels. None: not drawn (hidden text, wrapped, no position).
+    fn emoji_geometry(&self, doc: &ITextDocument, s: i32, e: i32, sy: i32) -> Option<(i32, i32, i32, f32)> {
+        unsafe {
+            let range = doc.Range(s, e).ok()?;
+            let font = range.GetFont().ok()?;
+            // tomTrue = -1.
+            if font.GetHidden().map(|h| h == -1).unwrap_or(false) {
+                return None;
+            }
+            let size = font.GetSize().ok()? as f64;
+            let (mut x0, mut y0, mut x1, mut y1) = (0i32, 0i32, 0i32, 0i32);
+            // Window coordinates (also off the window), at the baseline: the left edge of the
+            // first character and the left edge of the position after the cluster (tomEnd with
+            // TA_RIGHT would be the right edge of the next character — a comma, a space).
+            const F: i32 = 0x100 | 0x200;
+            range.GetPoint(tomConstants(F | 32 | 24), &mut x0, &mut y0).ok()?;
+            range.GetPoint(tomConstants(F | 24), &mut x1, &mut y1).ok()?;
+            if y0 != y1 || x1 - x0 < 2 {
+                return None;
+            }
+            let px = size * self.dpi.get() as f64 / 72.0 * (self.view_zoom() as f64 / 100.0);
+            Some((x0, x1, y0 + sy, px as f32))
+        }
+    }
+
     /// The document is fully loaded: deferred actions.
     fn on_load_done(&self, _anchor: Option<Anchor>) {
         if let Some(r) = self.next_ratio.take() {
@@ -2445,6 +2612,8 @@ impl App {
         v.image_pos.clear();
         v.chips.clear();
         v.chip_geo.clear();
+        v.emoji = render::emoji_clusters(&text).into_iter().map(|(s, e)| (s, e, text[s as usize..e as usize].into())).collect();
+        v.emoji_geo.clear();
         let mut stack: Vec<(usize, i32)> = Vec::new();
         let mut img_open: Option<(usize, i32)> = None;
         let mut chip_open: Option<i32> = None;
@@ -2579,6 +2748,7 @@ impl App {
         let gen = self.vs.borrow().gen;
         let mut ok: Vec<(usize, Rc<String>)> = Vec::new();
         let mut bad: Vec<usize> = Vec::new();
+        let mut remote_failed: Vec<(String, String)> = Vec::new();
         for d in done {
             if d.gen != gen {
                 continue;
@@ -2605,7 +2775,10 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    let src = self.vs.borrow().images.get(d.id).map(|i| short_src(&i.src)).unwrap_or_default();
+                    let (src, remote) = self.vs.borrow().images.get(d.id).map(|i| (short_src(&i.src), is_remote_src(&i.src))).unwrap_or_default();
+                    if remote {
+                        remote_failed.push((src.clone(), e.clone()));
+                    }
                     self.vs.borrow_mut().failed.push((src, e));
                     bad.extend(ids);
                 }
@@ -2620,6 +2793,35 @@ impl App {
         unfreeze(self.view, frozen);
         self.suppress.set(self.suppress.get() - 1);
         self.report_image_failures();
+        // Images from the internet that the user asked for and that failed: say why right in
+        // the bar (the status bar is overwritten by hover hints, and "Load" looked broken).
+        if let Some((src, why)) = remote_failed.last() {
+            let n = remote_failed.len();
+            self.show_info_message(&trf!(
+                "Could not load images from the internet: {n}. Last one: {src} — {why}",
+                "Не удалось загрузить картинки из интернета: {n}. Последняя: {src} — {why}"
+            ));
+        }
+    }
+
+    /// Remember the answer about images from the internet for the current document.
+    fn remember_remote_choice(&self, load: bool) {
+        if let Some(p) = self.doc.borrow().path.clone() {
+            self.remote_choice.borrow_mut().insert(p, load);
+        }
+    }
+
+    /// The yellow bar with a message and only a "✕" button.
+    fn show_info_message(&self, text: &str) {
+        ui::set_items(self.info, vec![Item::button(C_INFO_CLOSE, "✕", tr!("Hide", "Скрыть")).right()]);
+        ui::set_text(self.info, text, "");
+        if !self.info_visible.get() {
+            self.info_visible.set(true);
+            unsafe {
+                let _ = ShowWindow(self.info, SW_SHOW);
+            }
+            self.layout();
+        }
     }
 
     fn report_image_failures(&self) {
@@ -2791,8 +2993,8 @@ impl App {
             "install" => self.launch_setup(),
             "default" => {
                 // The installer did the registration; here it's only the user's choice in the system dialog.
-                if let Some(dir) = util::exe_dir() {
-                    install::prompt_default(Some(self.hwnd), &dir.join(install::HELP_DOC));
+                if util::exe_dir().is_some() {
+                    install::prompt_default_with_hint(Some(self.hwnd));
                     self.show_welcome(false);
                 }
             }
@@ -3223,7 +3425,10 @@ impl App {
             C_ZOOM_IN => self.zoom_by(10),
             C_ZOOM_OUT => self.zoom_by(-10),
             C_ZOOM_RESET => self.zoom_set(100),
-            C_REMOTE_ONCE => self.load_remote_images(),
+            C_REMOTE_ONCE => {
+                self.remember_remote_choice(true);
+                self.load_remote_images();
+            }
             C_REMOTE_ALWAYS => {
                 {
                     let mut s = self.settings.borrow_mut();
@@ -3235,7 +3440,10 @@ impl App {
             }
             C_SETUP => self.launch_setup(),
             C_INFO_CLOSE => {
-                self.vs.borrow_mut().remote_waiting.clear();
+                let asked = !std::mem::take(&mut self.vs.borrow_mut().remote_waiting).is_empty();
+                if asked {
+                    self.remember_remote_choice(false);
+                }
                 self.show_info_bar(0);
             }
             C_BOLD => self.wrap("**", "**"),
@@ -3837,16 +4045,19 @@ impl App {
             richedit::set_sel(self.view, 0, 0);
         }
 
-        // Smooth wheel scrolling: the window moves by about 3 lines.
+        // Smooth wheel scrolling: the view moves by one wheel step (Windows' lines-per-notch
+        // setting) over several frames, paced like the message loop (DwmFlush). Without a real
+        // display (CI runners) frames are slow and the fallback timer draws some of them, so the
+        // check waits for the end of the animation and counts every frame.
         {
             richedit::set_scroll_pos(self.view, 0, 0);
             let y0 = richedit::scroll_pos(self.view).1;
+            let want = self.wheel_step(self.view, -1.0).min((max_scroll(self.view) - y0 as f64).max(0.0));
+            self.smooth_frames.set(0);
             send(self.view, WM_MOUSEWHEEL, ((-120i32 as u32 as usize) << 16) & 0xFFFF_0000, 0);
             let t = std::time::Instant::now();
             let mut msg = MSG::default();
-            // Like the message loop (run): frames paced by DwmFlush.
-            let mut frames = 0;
-            while t.elapsed() < std::time::Duration::from_millis(500) {
+            while self.smooth.get().active && t.elapsed() < std::time::Duration::from_secs(3) {
                 unsafe {
                     while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                         let _ = TranslateMessage(&msg);
@@ -3854,18 +4065,15 @@ impl App {
                     }
                     if self.smooth.get().active {
                         self.smooth_frame();
-                        frames += 1;
                         if DwmFlush().is_err() {
                             std::thread::sleep(std::time::Duration::from_millis(4));
                         }
-                    } else {
-                        std::thread::sleep(std::time::Duration::from_millis(4));
                     }
                 }
             }
-            let dy = richedit::scroll_pos(self.view).1 - y0;
-            let want = self.line_px(self.view) * 3.0;
-            check(&format!("smooth wheel scrolling reaches the target ({frames} frames)"), (dy as f64 - want).abs() <= want * 0.5 && !self.smooth.get().active && frames >= 10);
+            let (dy, frames, done) = (richedit::scroll_pos(self.view).1 - y0, self.smooth_frames.get(), !self.smooth.get().active);
+            let close = (dy as f64 - want).abs() <= (want * 0.1).max(3.0);
+            check(&format!("smooth wheel scrolling reaches the target: {dy} of {want:.0} px in {frames} frames, finished {done}"), done && close && frames >= 3);
             richedit::set_scroll_pos(self.view, 0, 0);
         }
 
@@ -3897,6 +4105,48 @@ impl App {
             let (d_inc, d_chips) = (differ(&inc, &full), differ(&full, &none));
             check(&format!("inline `code` backgrounds are visible in the capture ({d_chips} px)"), d_chips > 50);
             check(&format!("inline `code` backgrounds after scrolling = full repaint (difference {d_inc} px)"), d_inc <= 20);
+            richedit::set_scroll_pos(self.view, 0, 0);
+        }
+
+        // Color emoji (emoji.rs over RichEdit's outlines): yellow pixels of 🟡 appear only with
+        // the overlay, and scrolling frame by frame gives the same picture as a full repaint.
+        {
+            let redraw = || unsafe {
+                let _ = RedrawWindow(Some(self.view), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+            };
+            // A hue family, not an exact color: Segoe UI Emoji differs between Windows versions.
+            // Counted only where the overlay changed the pixel: yellowish pixels present in both
+            // pictures (ClearType fringes, the theme's amber) don't count.
+            let is_yellow = |p: &[u8]| {
+                let (r, g, b) = (p[2] as i32, p[1] as i32, p[0] as i32);
+                r >= 200 && g >= 165 && b <= 130 && r - b >= 110 && r - g <= 70
+            };
+            let yellow = |with: &[u8], without: &[u8]| with.chunks_exact(4).zip(without.chunks_exact(4)).filter(|(p, q)| is_yellow(p) && !is_yellow(q)).count();
+            let differ = |a: &[u8], b: &[u8]| a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(p, q)| p[..3] != q[..3]).count();
+            let found = self.vs.borrow().emoji.len();
+            // The renderer is created after the first paint (WM_APP_EMOJI); here the message
+            // loop does not run yet.
+            self.ensure_emoji_painter();
+            richedit::set_scroll_pos(self.view, 0, 0);
+            redraw();
+            for _ in 0..8 {
+                let y = richedit::scroll_pos(self.view).1;
+                richedit::set_scroll_pos(self.view, 0, y + 5);
+                unsafe {
+                    let _ = UpdateWindow(self.view);
+                }
+            }
+            let (_, _, inc) = capture_client(self.hwnd);
+            redraw();
+            let (_, _, full) = capture_client(self.hwnd);
+            let saved = self.emoji_painter.replace(Some(None));
+            redraw();
+            let (_, _, plain) = capture_client(self.hwnd);
+            *self.emoji_painter.borrow_mut() = saved;
+            redraw();
+            let (y_full, y_plain, d_inc) = (yellow(&full, &plain), yellow(&plain, &full), differ(&inc, &full));
+            check(&format!("color emoji: {found} found, {y_full} px turn yellow with the overlay, {y_plain} the other way"), found >= 6 && y_full > 40 && y_plain < y_full / 4);
+            check(&format!("color emoji after scrolling = full repaint (difference {d_inc} px)"), d_inc <= 20);
             richedit::set_scroll_pos(self.view, 0, 0);
         }
 
@@ -3958,6 +4208,88 @@ impl App {
             edge_check("width: other column mode (narrow/full width)");
             self.toggle_wide();
             self.settings.borrow_mut().dirty = false;
+        }
+
+        let pump = |ms: u64| {
+            let t = std::time::Instant::now();
+            let mut msg = MSG::default();
+            while t.elapsed() < std::time::Duration::from_millis(ms) {
+                unsafe {
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let differ = |a: &[u8], b: &[u8]| a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(p, q)| p[..3] != q[..3]).count();
+
+        // Images from the internet (policy "ask"): the bar asks; after ✕ the question does not
+        // come back for this document on a re-render (it used to come back on every one).
+        {
+            let policy = self.settings.borrow().remote_images;
+            self.settings.borrow_mut().remote_images = RemoteImages::Ask;
+            self.render_view(true);
+            let asked = !self.vs.borrow().remote_waiting.is_empty() && self.info_visible.get();
+            self.command(C_INFO_CLOSE);
+            self.render_view(true);
+            let again = !self.vs.borrow().remote_waiting.is_empty() || self.info_visible.get();
+            check(&format!("images from the internet: the bar asks once, ✕ is remembered (asked {asked}, asked again {again})"), asked && !again);
+            self.remote_choice.borrow_mut().clear();
+            self.settings.borrow_mut().remote_images = policy;
+            self.render_view(true);
+            self.command(C_INFO_CLOSE);
+            self.remote_choice.borrow_mut().clear();
+        }
+
+        // The "?" button: a real mouse click on the toolbar opens the help page; Back returns.
+        {
+            unsafe {
+                let _ = RedrawWindow(Some(self.bar), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+            }
+            self.set_mode(Mode::Visual);
+            self.restyle_now();
+            unsafe {
+                let _ = RedrawWindow(Some(self.bar), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+            }
+            let rect = ui::item_rect(self.bar, C_HELP);
+            if let Some(r) = rect {
+                let at = (((r.top + r.bottom) / 2) as u32 as isize) << 16 | ((r.left + r.right) / 2) as u16 as isize;
+                send(self.bar, WM_LBUTTONDOWN, 1, at);
+                send(self.bar, WM_LBUTTONUP, 0, at);
+                pump(150);
+            }
+            let help = self.doc.borrow().welcome;
+            check(&format!("the “?” button opens the help page (button found: {})", rect.is_some()), help);
+            self.go_back();
+            pump(50);
+            let back = !self.doc.borrow().welcome && self.doc.borrow().path.as_deref() == Some(path.as_path());
+            check("Back returns from the help page to the document", back);
+        }
+
+        // Visual mode: changing the column width repaints the whole editor (the old layout used
+        // to stay next to the new one — the text looked duplicated side by side).
+        {
+            self.set_mode(Mode::Visual);
+            self.restyle_now();
+            unsafe {
+                let _ = RedrawWindow(Some(self.src()), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+            }
+            self.toggle_wide();
+            unsafe {
+                let _ = UpdateWindow(self.src());
+            }
+            let (_, _, after) = capture_client(self.hwnd);
+            unsafe {
+                let _ = RedrawWindow(Some(self.src()), None, None, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+            }
+            let (_, _, full) = capture_client(self.hwnd);
+            let d = differ(&after, &full);
+            self.toggle_wide();
+            self.settings.borrow_mut().dirty = false;
+            self.set_mode(Mode::View);
+            check(&format!("visual mode: changing the column width repaints the editor (difference {d} px)"), d <= 50);
         }
 
         // Switching modes without edits doesn't change the file.
@@ -4107,6 +4439,150 @@ impl App {
         self.find_next("Списки", true, false);
         let (fa, fb) = richedit::get_sel(self.view);
         check("search finds text in the view", fb > fa);
+
+        // Keyboard shortcuts and editor commands. The modifier state is passed to the handler
+        // directly, so the self-test presses Ctrl/Shift/Alt combinations without the real keyboard.
+        // File dialogs (Ctrl+O, Ctrl+Shift+S) and the clipboard are not exercised here.
+        {
+            let key = |hwnd: HWND, vk: VIRTUAL_KEY, ctrl: bool, shift: bool, alt: bool| -> bool {
+                let msg = MSG { hwnd, message: WM_KEYDOWN, wParam: WPARAM(vk.0 as usize), ..Default::default() };
+                handle_key_with(&msg, ctrl, shift, alt)
+            };
+            self.set_mode(Mode::View);
+            key(self.view, VK_2, true, false, false);
+            let m2 = self.mode.get() == Mode::Visual;
+            key(self.src(), VK_3, true, false, false);
+            let m3 = self.mode.get() == Mode::Code;
+            key(self.src(), VK_ESCAPE, false, false, false);
+            let esc = self.mode.get() == Mode::View;
+            key(self.view, VK_3, true, false, false);
+            key(self.src(), VK_1, true, false, false);
+            check("keys: Ctrl+2 / Ctrl+3 / Esc / Ctrl+1 switch modes", m2 && m3 && esc && self.mode.get() == Mode::View);
+
+            let z0 = self.settings.borrow().zoom;
+            key(self.view, VK_OEM_PLUS, true, false, false);
+            let zin = self.settings.borrow().zoom == z0 + 10;
+            key(self.view, VK_OEM_MINUS, true, false, false);
+            key(self.view, VK_OEM_MINUS, true, false, false);
+            let zout = self.settings.borrow().zoom + 10 == z0;
+            key(self.view, VK_0, true, false, false);
+            check("keys: Ctrl+plus / Ctrl+minus / Ctrl+0 change the zoom", zin && zout && self.settings.borrow().zoom == 100);
+            self.zoom_set(z0);
+
+            richedit::set_scroll_pos(self.view, 0, 0);
+            let mut ys = Vec::new();
+            for vk in [VK_DOWN, VK_NEXT, VK_SPACE, VK_END, VK_UP, VK_PRIOR, VK_HOME] {
+                key(self.view, vk, false, false, false);
+                // Wait for the smooth scroll animation to finish (up to 2 s).
+                let t0 = std::time::Instant::now();
+                pump(30);
+                while self.smooth.get().active && t0.elapsed() < std::time::Duration::from_secs(2) {
+                    pump(30);
+                }
+                ys.push(richedit::scroll_pos(self.view).1);
+            }
+            let moved = ys[0] > 0 && ys[1] > ys[0] && ys[2] > ys[1] && ys[3] >= ys[2] && ys[4] < ys[3] && ys[5] < ys[4] && ys[6] == 0;
+            key(self.view, VK_A, true, false, false);
+            let (sa, sb) = richedit::get_sel(self.view);
+            check(&format!("keys: Down/PgDn/Space/End/Up/PgUp/Home scroll {ys:?}, Ctrl+A selects all ({sa}..{sb})"), moved && sa == 0 && sb > 100);
+            richedit::set_sel(self.view, 0, 0);
+            if !self.find.borrow().last.is_empty() {
+                key(self.view, VK_F3, false, false, false);
+                key(self.view, VK_F3, false, true, false);
+            }
+
+            // Formatting in the Visual editor on the word "Обычный" of a plain paragraph;
+            // the original text is restored after every step.
+            self.set_mode(Mode::Visual);
+            self.restyle_now();
+            let original = src_text();
+            let restore = |orig: &str| {
+                richedit::set_sel(self.src(), 0, -1);
+                richedit::replace_sel(self.src(), orig, false);
+                self.restyle_now();
+            };
+            let select_word = || {
+                let t = src_text();
+                t.find("Обычный").map(|i| {
+                    let a = t[..i].encode_utf16().count() as i32;
+                    richedit::set_sel(self.src(), a, a + "Обычный".encode_utf16().count() as i32);
+                })
+            };
+            let mut results = Vec::new();
+            let steps: [(&str, VIRTUAL_KEY, bool, &str); 12] = [
+                ("Ctrl+B", VK_B, false, "**Обычный**"),
+                ("Ctrl+I", VK_I, false, "*Обычный*"),
+                ("Ctrl+Shift+X", VK_X, true, "~~Обычный~~"),
+                ("Ctrl+E", VK_E, false, "`Обычный`"),
+                ("Ctrl+K", VK_K, false, "[Обычный](https://)"),
+                ("Ctrl+Q", VK_Q, false, "> "),
+                ("Ctrl+Shift+8", VK_8, true, "- "),
+                ("Ctrl+Shift+7", VK_7, true, "1. "),
+                ("Ctrl+Shift+1", VK_1, true, "# "),
+                ("Ctrl+Shift+2", VK_2, true, "## "),
+                ("Ctrl+Shift+6", VK_6, true, "###### "),
+                ("Ctrl+Shift+0", VK_0, true, ""),
+            ];
+            for (name, vk, shift, want) in steps {
+                if select_word().is_none() {
+                    results.push(format!("{name}: word not found"));
+                    continue;
+                }
+                let before = src_text();
+                key(self.src(), vk, true, shift, false);
+                self.restyle_now();
+                let after = src_text();
+                let good = if want.is_empty() { after == before } else { after != before && after.contains(want) };
+                if !good {
+                    results.push(name.to_string());
+                }
+                restore(&original);
+            }
+            // Toolbar commands without shortcuts: headings 2/3, task list, table, rule.
+            for (name, cmd, want) in [("H2", C_H2, "## "), ("H3", C_H3, "### "), ("task", C_TASK, "- [ ] "), ("table", C_TABLE, "| --- |"), ("rule", C_HR, "---")] {
+                if select_word().is_none() {
+                    results.push(format!("{name}: word not found"));
+                    continue;
+                }
+                self.command(cmd);
+                self.restyle_now();
+                if !src_text().contains(want) {
+                    results.push(name.to_string());
+                }
+                restore(&original);
+            }
+            // Enter / Shift+Enter / Tab / Shift+Tab in a list item.
+            let t = src_text();
+            if let Some(i) = t.find("- Третий пункт") {
+                let end = t[..i].encode_utf16().count() as i32 + "- Третий пункт".encode_utf16().count() as i32;
+                richedit::set_sel(self.src(), end, end);
+                key(self.src(), VK_RETURN, false, false, false);
+                key(self.src(), VK_TAB, false, false, false);
+                let indented = src_text().contains("\r  - ");
+                key(self.src(), VK_TAB, false, true, false);
+                key(self.src(), VK_RETURN, false, true, false);
+                self.restyle_now();
+                if !indented {
+                    results.push("Enter/Tab in a list".into());
+                }
+                restore(&original);
+            }
+            check(&format!("keys and toolbar commands edit the text ({})", if results.is_empty() { "all".to_string() } else { format!("failed: {}", results.join(", ")) }), results.is_empty());
+            check("the editor text is restored after the formatting checks", src_text() == original);
+            key(self.src(), VK_ESCAPE, false, false, false);
+
+            // Theme toggle there and back.
+            let dark = self.theme.get().dark;
+            self.command(C_THEME);
+            let flipped = self.theme.get().dark != dark;
+            self.command(C_THEME);
+            check("the theme button switches light/dark and back", flipped && self.theme.get().dark == dark);
+            self.settings.borrow_mut().dirty = false;
+
+            // Reload (F5) of an unmodified document keeps it open.
+            key(self.view, VK_F5, false, false, false);
+            check("F5 reloads the document", self.doc.borrow().path.as_deref() == Some(path.as_path()) && !modified());
+        }
 
         // RTF injection: a document starting with {\rtf is plain text in the editor.
         let inj_path = path.with_file_name("rtf-inject.md");
@@ -4418,6 +4894,12 @@ fn image_key(img: &ImageReq, max_w: u32, dpi: u32, base: Option<&Path>) -> u64 {
 }
 
 /// Image address for messages (data: URLs can be megabytes long).
+/// An image address from the internet (http/https), as opposed to a local file or data:.
+fn is_remote_src(s: &str) -> bool {
+    let s = s.trim_start().to_ascii_lowercase();
+    s.starts_with("http://") || s.starts_with("https://") || s.starts_with("//")
+}
+
 fn short_src(s: &str) -> String {
     if s.chars().count() <= 120 {
         s.to_string()
@@ -4584,6 +5066,16 @@ fn capture_client(hwnd: HWND) -> (i32, i32, Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The program's own window messages never share a number (one used to swallow another).
+    #[test]
+    fn app_messages_are_distinct() {
+        let ids = [WM_APP_IMG, WM_APP_RESTYLE, WM_APP_EMOJI, ui::WM_BAR_HINT];
+        for (i, a) in ids.iter().enumerate() {
+            assert!(*a >= WM_APP, "{a:#x} is below WM_APP");
+            assert!(!ids[i + 1..].contains(a), "message {a:#x} is used twice");
+        }
+    }
 
     /// A path with backticks doesn't escape the `code` span on the start page (0.2.0 audit finding).
     #[test]

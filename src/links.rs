@@ -721,4 +721,348 @@ mod tests {
         assert!(prepare_local(&ok).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A unique scratch folder inside the project (never the system temp folder).
+    fn scratch(name: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".toolcache").join("tmp").join(format!("links-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn extension_helpers() {
+        // no extension at all
+        assert!(!is_dangerous_ext(Path::new("README")));
+        assert!(!is_md_ext(Path::new("README")));
+        assert!(!is_openable_ext(Path::new("README")));
+        // case-insensitive
+        assert!(is_dangerous_ext(Path::new("A.EXE")));
+        assert!(is_dangerous_ext(Path::new("x.Library-Ms")));
+        for p in ["a.md", "a.MARKDOWN", "a.mdown", "a.mkd", "a.mkdn", "a.mdwn", "a.mdtxt", "a.mdtext"] {
+            assert!(is_md_ext(Path::new(p)), "{p}");
+        }
+        assert!(!is_md_ext(Path::new("a.mdx")));
+        // a non-ASCII extension is never openable (Unicode case tricks)
+        assert!(!is_openable_ext(Path::new("a.рng")));
+        assert!(is_openable_ext(Path::new("a.Mp4")));
+    }
+
+    #[test]
+    fn percent_decoding() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("%D0%A0%d1%8b"), "Ры");
+        // invalid or truncated escapes stay as is
+        assert_eq!(percent_decode("%zz%4"), "%zz%4");
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("100%"), "100%");
+        // a broken UTF-8 sequence becomes U+FFFD, not a panic
+        assert_eq!(percent_decode("%FF"), "\u{FFFD}");
+    }
+
+    #[test]
+    fn scheme_detection() {
+        assert_eq!(scheme_of("HTTPS://x").as_deref(), Some("https"));
+        assert_eq!(scheme_of("ms-settings:").as_deref(), Some("ms-settings"));
+        assert_eq!(scheme_of("svn+ssh://x").as_deref(), Some("svn+ssh"));
+        assert_eq!(scheme_of("C:\\x.md"), None, "a drive letter is not a scheme");
+        assert_eq!(scheme_of("no colon"), None);
+        assert_eq!(scheme_of("1ab:x"), None, "must start with a letter");
+        assert_eq!(scheme_of("a b:x"), None, "no spaces");
+        assert_eq!(scheme_of("dir/a.md:stream"), None, "no slashes");
+        assert_eq!(scheme_of(":x"), None);
+    }
+
+    #[test]
+    fn hidden_control_ranges() {
+        for c in [
+            '\u{0}', '\u{1F}', '\u{7F}', '\u{80}', '\u{9F}', '\u{AD}', '\u{61C}', '\u{180E}', '\u{200B}', '\u{200D}', '\u{200E}',
+            '\u{200F}', '\u{2028}', '\u{2029}', '\u{202A}', '\u{202E}', '\u{2060}', '\u{2064}', '\u{2066}', '\u{2069}', '\u{FE00}',
+            '\u{FE0F}', '\u{FEFF}', '\u{E0000}', '\u{E007F}',
+        ] {
+            assert!(has_hidden_controls(&format!("a{c}b")), "U+{:04X}", c as u32);
+        }
+        for s in ["https://example.com/a?b=c#d", "Привет мир", "日本語", "a\u{A0}b", "emoji 😀", "\u{2065}", "\u{FE10}"] {
+            assert!(!has_hidden_controls(s), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn classify_basic_branches() {
+        assert!(blocked(&classify("", None)));
+        assert!(blocked(&classify("   \t ", None)));
+        // anchors are percent-decoded
+        assert_eq!(classify("#%D0%A0%D0%B0%D0%B7", None), LinkAction::Anchor("Раз".into()));
+        assert_eq!(classify("  #top  ", None), LinkAction::Anchor("top".into()));
+        assert_eq!(classify("#", None), LinkAction::Anchor(String::new()));
+        // internal commands are recognised (executed only on the start page)
+        assert_eq!(classify("vmd:install", None), LinkAction::Internal("install".into()));
+        assert_eq!(classify("VMD:uninstall", None), LinkAction::Internal("uninstall".into()));
+        // unknown protocols are blocked and the message names the protocol
+        match classify("Steam://run/1", None) {
+            LinkAction::Blocked(m) => assert!(m.contains("steam:"), "{m}"),
+            x => panic!("{x:?}"),
+        }
+    }
+
+    #[test]
+    fn mailto_sanitisation() {
+        for u in ["mailto:a@b.c\"x", "mailto:<a@b.c>", "mailto:a@b.c\\x", "mailto:a`@b.c"] {
+            assert!(blocked(&classify(u, None)), "{u}");
+        }
+        // only subject/body/cc/bcc survive, keys are case-insensitive, order is kept
+        assert_eq!(
+            classify("mailto:a@b.c?CC=x@y.z&attach=C:/a&Body=hi&bcc=q@w.e&foo=1", None),
+            LinkAction::Mail("mailto:a@b.c?CC=x@y.z&Body=hi&bcc=q@w.e".into())
+        );
+        // spaces and special characters are encoded; "&" in the address becomes %26
+        assert_eq!(classify("mailto:a&b@c.d?subject=Hi there|x", None), LinkAction::Mail("mailto:a%26b@c.d?subject=Hi%20there%7Cx".into()));
+        assert_eq!(classify("mailto:a@b.c?", None), LinkAction::Mail("mailto:a@b.c".into()));
+        assert_eq!(classify("MAILTO:a@b.c", None), LinkAction::Mail("MAILTO:a@b.c".into()));
+    }
+
+    #[test]
+    fn file_urls() {
+        let md = |u: &str| match classify(u, None) {
+            LinkAction::OpenMarkdown { path, anchor } => (path, anchor),
+            x => panic!("{u}: {x:?}"),
+        };
+        assert_eq!(md("file:///C:/docs/a.md").0, PathBuf::from("C:\\docs\\a.md"));
+        assert_eq!(md("file://localhost/C:/docs/a.md#x"), (PathBuf::from("C:\\docs\\a.md"), Some("x".into())));
+        assert_eq!(md("file://LOCALHOST/C:/a.md").0, PathBuf::from("C:\\a.md"));
+        // without "//": file:/C:/x and file:C:/x
+        assert_eq!(md("file:/C:/a.md").0, PathBuf::from("C:\\a.md"));
+        assert_eq!(md("file:C:/a.md").0, PathBuf::from("C:\\a.md"));
+        assert_eq!(classify("file:///C:/docs/report.pdf", None), LinkAction::LocalFile(PathBuf::from("C:\\docs\\report.pdf")));
+        assert!(blocked(&classify("file:///C:/x/setup.exe", None)));
+        // no drive → treated as a network path
+        for u in ["file://localhost", "file://", "file:", "file:///", "file:///share/a.md", "file://localhost/share/a.md", "file:relative.md"] {
+            assert!(blocked(&classify(u, None)), "{u}");
+        }
+    }
+
+    #[test]
+    fn local_path_resolution() {
+        let b = base();
+        let ok = |raw: &str| resolve_local(raw, Some(&b)).unwrap_or_else(|e| panic!("{raw}: {e}"));
+        assert_eq!(ok("a.md"), (PathBuf::from("D:\\docs\\proj\\a.md"), None));
+        assert_eq!(ok("./sub/../a.md"), (PathBuf::from("D:\\docs\\proj\\a.md"), None));
+        // query is dropped, the fragment becomes the anchor (percent-decoded), an empty fragment is none
+        assert_eq!(ok("a.md?x=1#%D0%AF"), (PathBuf::from("D:\\docs\\proj\\a.md"), Some("Я".into())));
+        assert_eq!(ok("a.md#"), (PathBuf::from("D:\\docs\\proj\\a.md"), None));
+        assert_eq!(ok("my%20file.md").0, PathBuf::from("D:\\docs\\proj\\my file.md"));
+        // root-relative paths stay on the document's drive
+        assert_eq!(ok("/other/a.md").0, PathBuf::from("D:\\other\\a.md"));
+        assert_eq!(ok("\\other\\a.md").0, PathBuf::from("D:\\other\\a.md"));
+        // ".." never climbs above the drive root
+        assert_eq!(ok("../../../../x.md").0, PathBuf::from("D:\\x.md"));
+        // absolute paths ignore the base
+        assert_eq!(resolve_local("C:/x/y.md", None).unwrap().0, PathBuf::from("C:\\x\\y.md"));
+        // relative paths need a document folder
+        assert!(resolve_local("a.md", None).is_err());
+        assert!(resolve_local("/a.md", None).is_err());
+        assert!(matches!(classify("a.md", None), LinkAction::Blocked(_)));
+    }
+
+    #[test]
+    fn local_path_rejections() {
+        let b = base();
+        let err = |raw: &str| resolve_local(raw, Some(&b)).expect_err(raw);
+        // control characters hidden behind percent-encoding
+        assert!(err("a%09b.md").contains("control characters"));
+        assert!(err("a%E2%80%AEdm.exe").contains("control characters"));
+        // nothing left after dropping the query/fragment
+        assert!(err("?x=1").contains("Empty path"));
+        assert!(err("#frag").contains("Empty path"));
+        // wildcard and reserved characters (also when percent-encoded)
+        for raw in ["a*.md", "a<b.md", "a>b.md", "a|b.md", "a\"b.md", "a%3Fb.md", "a%2Ab.md"] {
+            assert!(err(raw).contains("Invalid characters"), "{raw}");
+        }
+        // NTFS streams: a colon anywhere but after the drive letter
+        for raw in ["dir/a.md:stream", "C:/a.md:stream", "a.md%3A%24DATA", "C:x:y"] {
+            assert!(err(raw).contains("alternate streams"), "{raw}");
+        }
+        // network paths, also hidden behind encoding or a forward-slash prefix
+        for raw in ["\\\\srv\\s\\a.md", "//srv/s/a.md", "%2F%2Fsrv/s/a.md", "/\\srv\\a.md"] {
+            assert!(err(raw).contains("Network paths"), "{raw}");
+        }
+        // trailing dots/spaces and leading spaces in any component
+        for raw in ["setup.exe.", "setup.exe%20", "dir%20/a.md", "%20dir/a.md", "dir/ a.png"] {
+            assert!(err(raw).contains("trailing dot or space"), "{raw}");
+        }
+        // device names, with or without an extension, in any component
+        for raw in ["con", "PRN.txt", "aux.md", "Nul", "com1.png", "LPT9", "conin$", "CONOUT$", "dir/com3/a.md", "lpt¹.md", "con .md"] {
+            assert!(err(raw).contains("device names") || err(raw).contains("trailing dot or space"), "{raw}");
+        }
+        // "console.md" and "community.png" are ordinary names
+        assert!(resolve_local("console.md", Some(&b)).is_ok());
+        assert!(resolve_local("com10.png", Some(&b)).is_ok());
+    }
+
+    /// A document opened from a network share must not resolve relative links onto the share.
+    #[test]
+    fn relative_links_from_a_network_folder_are_blocked() {
+        let unc = PathBuf::from("\\\\server\\share\\docs");
+        assert!(resolve_local("a.md", Some(&unc)).unwrap_err().contains("Network paths"));
+        assert!(resolve_local("/a.png", Some(&unc)).unwrap_err().contains("Network paths"));
+        assert!(blocked(&classify("img/a.png", Some(&unc))));
+        // an absolute local path is still fine
+        assert!(resolve_local("C:/a.md", Some(&unc)).is_ok());
+    }
+
+    #[test]
+    fn local_link_kinds() {
+        let b = base();
+        assert!(matches!(classify("notes/x.MARKDOWN", Some(&b)), LinkAction::OpenMarkdown { .. }));
+        assert_eq!(classify("report.pdf", Some(&b)), LinkAction::LocalFile(PathBuf::from("D:\\docs\\proj\\report.pdf")));
+        assert_eq!(classify("folder", Some(&b)), LinkAction::LocalFile(PathBuf::from("D:\\docs\\proj\\folder")));
+        // the block message names the extension as written
+        match classify("tools/Run.CMD", Some(&b)) {
+            LinkAction::Blocked(m) => assert!(m.contains(".CMD"), "{m}"),
+            x => panic!("{x:?}"),
+        }
+        // dangerous types in the middle of the path are fine — only the final name counts
+        assert!(matches!(classify("x.exe/readme.md", Some(&b)), LinkAction::OpenMarkdown { .. }));
+    }
+
+    #[test]
+    fn lexical_normalisation() {
+        assert_eq!(normalize(Path::new(".\\a\\.\\b")), PathBuf::from("a\\b"));
+        assert_eq!(normalize(Path::new("D:\\a\\b\\..\\c")), PathBuf::from("D:\\a\\c"));
+        assert_eq!(normalize(Path::new("D:\\..\\..\\c")), PathBuf::from("D:\\c"));
+        assert_eq!(normalize(Path::new("..\\a")), PathBuf::from("a"), "a leading .. is dropped");
+        assert_eq!(normalize(Path::new("\\\\srv\\share\\..\\x")), PathBuf::from("\\\\srv\\share\\x"), "the UNC prefix is kept");
+        assert_eq!(normalize(Path::new("")), PathBuf::new());
+    }
+
+    #[test]
+    fn web_addresses() {
+        let web = |u: &str| match classify(u, None) {
+            LinkAction::Web { url, host, warn } => (url, host, warn),
+            x => panic!("{u}: {x:?}"),
+        };
+        // host is lowercased, port and path dropped from it
+        let (url, host, warn) = web("HTTPS://Example.COM:8443/Path?q=1#f");
+        assert_eq!((url.as_str(), host.as_str(), warn), ("HTTPS://Example.COM:8443/Path?q=1#f", "example.com", None));
+        assert_eq!(web("http://example.com?x").1, "example.com");
+        assert_eq!(web("http://example.com#x").1, "example.com");
+        // IPv6 literal keeps its brackets
+        assert_eq!(web("http://[::1]:8080/x").1, "[::1]");
+        assert_eq!(web("http://[2001:db8::1]/").1, "[2001:db8::1]");
+        // every special character is percent-encoded before reaching the handler
+        assert_eq!(web("https://e.com/a b\"c<d>e\\f^g`h{i|j}k").0, "https://e.com/a%20b%22c%3Cd%3Ee%5Cf%5Eg%60h%7Bi%7Cj%7Dk");
+        // user@host: warning, and the host is the part after the last "@"
+        let (_, host, warn) = web("https://a@b@evil.example/x");
+        assert_eq!(host, "evil.example");
+        let warn = warn.unwrap();
+        assert!(warn.contains("“a@b@”") && warn.contains("“evil.example”"), "{warn}");
+        // non-Latin letters in the host: warning
+        let (_, host, warn) = web("https://аpple.com/");
+        assert_eq!(host, "аpple.com");
+        assert!(warn.unwrap().contains("non-Latin"));
+        // the userinfo warning wins over the non-Latin one
+        assert!(web("https://x@рф.example/").2.unwrap().contains("@"));
+    }
+
+    #[test]
+    fn invalid_web_addresses() {
+        // no "://", no host, no host after userinfo, only a port
+        for u in ["http:example.com", "https:///path", "https://user@/x", "http://:80/", "https://?q", "https://#f"] {
+            assert!(blocked(&classify(u, None)), "{u}");
+        }
+        for u in ["https://exa mple.com/", "https://exa{mple.com", "https://a\"b.com", "https://a<b.com", "https://a`b.com", "https://a|b.com", "https://a^b.com", "https://a}b.com", "https://a\\b.com"] {
+            match classify(u, None) {
+                LinkAction::Blocked(m) => assert!(m.contains("Invalid site name"), "{u}: {m}"),
+                x => panic!("{u}: {x:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn spoof_detection_details() {
+        // explicit scheme or www. → compared even with a "file" extension
+        assert!(spoof_warning("http://bank.md/login", "evil.example").is_some());
+        assert!(spoof_warning("www.bank.rs", "evil.example").is_some());
+        // ports, paths, userinfo and trailing dots in the shown text are ignored
+        assert!(spoof_warning("github.com:443", "github.com").is_none());
+        assert!(spoof_warning("github.com/user/repo", "github.com").is_none());
+        assert!(spoof_warning("github.com.", "github.com").is_none());
+        assert!(spoof_warning("me@github.com", "github.com").is_none());
+        assert!(spoof_warning("me@bank.com", "evil.example").is_some());
+        // brackets, quotes and guillemets around the shown domain
+        assert!(spoof_warning("(bank.com)", "evil.example").is_some());
+        assert!(spoof_warning("«bank.com»", "evil.example").is_some());
+        assert!(spoof_warning("\"bank.com\",", "evil.example").is_some());
+        // case and www. on either side
+        assert!(spoof_warning("WWW.GitHub.COM", "www.github.com").is_none());
+        // not domains: numeric TLD, one-letter TLD, a leading dot, version numbers
+        for t in ["1.2.3.4", "a.b", ".hidden", "v1.2", "see section 3.4", "e.g. this", "..."] {
+            assert!(spoof_warning(t, "evil.example").is_none(), "{t}");
+        }
+        // a parent domain shown for a subdomain is fine, the reverse is not
+        assert!(spoof_warning("docs.github.com", "github.com").is_some());
+        assert!(spoof_warning("evilgithub.com", "github.com").is_some());
+        // the first mismatching domain is reported
+        let w = spoof_warning("github.com or bank.com", "github.com").unwrap();
+        assert!(w.contains("“bank.com”") && w.contains("“github.com”"), "{w}");
+        // look-alike dots: ideographic and halfwidth
+        assert!(spoof_warning("bank\u{3002}com", "evil.example").is_some());
+        assert!(spoof_warning("bank\u{FF61}com", "evil.example").is_some());
+        assert!(spoof_warning("bank\u{2024}com", "evil.example").is_some());
+        assert!(spoof_warning("ba\u{00AD}nk.com", "bank.com").is_none(), "a soft hyphen is removed before comparing");
+    }
+
+    #[test]
+    fn prepare_local_checks() {
+        let dir = scratch("prepare");
+        // a missing file
+        let missing = dir.join("missing.png");
+        assert!(prepare_local(&missing).unwrap_err().contains("File not found"));
+        // long_path of a missing file returns it unchanged
+        assert_eq!(long_path(&missing), missing);
+        // an existing file of an openable type: its long name is returned
+        let ok = dir.join("Photo Long Name.png");
+        std::fs::write(&ok, b"x").unwrap();
+        assert_eq!(prepare_local(&ok).unwrap(), long_path(&ok));
+        assert!(long_path(&ok).ends_with("Photo Long Name.png"));
+        // a dangerous type is blocked even if it exists
+        let bad = dir.join("tool.ps1");
+        std::fs::write(&bad, b"x").unwrap();
+        assert!(prepare_local(&bad).unwrap_err().contains(".ps1"));
+        // a folder passes (it is only ever shown in Explorer)
+        assert!(prepare_local(&dir).is_ok());
+        // no symbolic links in an ordinary path
+        assert!(!has_symlink_component(&ok));
+        assert!(!has_symlink_component(&missing));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symbolic link anywhere in the path is rejected. Creating one needs Developer Mode
+    /// or the SeCreateSymbolicLink privilege; without them the check is skipped.
+    #[test]
+    fn symlinks_are_rejected() {
+        let dir = scratch("symlink");
+        let real_dir = dir.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let file = real_dir.join("a.png");
+        std::fs::write(&file, b"x").unwrap();
+        let link_file = dir.join("link.png");
+        let link_dir = dir.join("linkdir");
+        let made_file = std::os::windows::fs::symlink_file(&file, &link_file).is_ok();
+        let made_dir = std::os::windows::fs::symlink_dir(&real_dir, &link_dir).is_ok();
+        if made_file {
+            assert!(has_symlink_component(&link_file));
+            assert!(prepare_local(&link_file).unwrap_err().contains("symbolic link"));
+        }
+        if made_dir {
+            let through = link_dir.join("a.png");
+            assert!(has_symlink_component(&through), "a link in the middle of the path");
+            assert!(prepare_local(&through).unwrap_err().contains("symbolic link"));
+        }
+        if !made_file && !made_dir {
+            eprintln!("symbolic links cannot be created here (no Developer Mode) — check skipped");
+        }
+        assert!(!has_symlink_component(&file));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

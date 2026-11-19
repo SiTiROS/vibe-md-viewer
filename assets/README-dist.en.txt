@@ -12,8 +12,9 @@ INSTALLATION
 2. In the setup window click "Install" and confirm the administrator prompt.
    The program installs into C:\Program Files\vibe-md-viewer.
    Without administrator rights a just-for-me installation is offered.
-3. Windows shows "How do you want to open this file?" — choose vibe-md-viewer
-   and tick "Always use this app".
+3. Windows Settings → Default apps opens. Windows 11: on the vibe-md-viewer page
+   set it for .md. Windows 10: click "Choose default apps by file type", find .md
+   and pick vibe-md-viewer.
 
 Done: .md files open with a double-click.
 

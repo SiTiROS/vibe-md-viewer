@@ -2,6 +2,7 @@
 
 use windows::core::{Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, POINT, POINTL, RECT};
+use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
 use windows::Win32::UI::Controls::RichEdit::*;
 use windows::Win32::UI::Controls::{
@@ -256,6 +257,12 @@ pub fn set_margins(hwnd: HWND, left: i32, top: i32, right: i32, bottom: i32) {
     }
     // EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN
     send(hwnd, 0x00D3, 3, (((right as u32) << 16) | left as u32) as isize);
+    // Unlike EM_SETRECT, EM_SETMARGINS does not repaint the area outside the new text
+    // rectangle: the old layout stayed there and the text looked duplicated side by side
+    // (Visual mode, toggling the column width). Repaint the whole control.
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, true);
+    }
 }
 
 pub fn get_rect(hwnd: HWND) -> RECT {
@@ -345,4 +352,282 @@ pub fn scroll_scrollcaret_top(hwnd: HWND, cp: i32) {
     let (sx, sy) = scroll_pos(hwnd);
     let rc = get_rect(hwnd);
     set_scroll_pos(hwnd, sx, (sy + y - rc.top - 8).max(0));
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use windows::Win32::UI::Controls::{EM_CANUNDO, EM_GETLIMITTEXT};
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    /// An off-screen popup with a RichEdit child created by `create` (never activated,
+    /// no taskbar button). Destroyed on drop. Hold `testutil::richedit_lock()` while it lives.
+    pub(crate) struct Host {
+        pub parent: HWND,
+        pub edit: HWND,
+    }
+
+    impl Host {
+        pub(crate) fn new(readonly: bool, w: i32, h: i32) -> Host {
+            assert!(load_library());
+            let class = wide("STATIC");
+            let parent = unsafe {
+                CreateWindowExW(
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    PCWSTR::from_raw(class.as_ptr()),
+                    PCWSTR::null(),
+                    WS_POPUP | WS_CLIPCHILDREN,
+                    -4000,
+                    -4000,
+                    w,
+                    h,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .unwrap();
+            let edit = create(parent, 7, readonly);
+            assert!(!edit.0.is_null());
+            unsafe {
+                let _ = MoveWindow(edit, 0, 0, w, h, false);
+                let _ = ShowWindow(edit, SW_SHOWNOACTIVATE);
+                let _ = ShowWindow(parent, SW_SHOWNOACTIVATE);
+            }
+            Host { parent, edit }
+        }
+    }
+
+    impl Drop for Host {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.parent);
+            }
+        }
+    }
+
+    pub(crate) fn text(hwnd: HWND) -> String {
+        String::from_utf16_lossy(&get_text(hwnd))
+    }
+
+    fn style(hwnd: HWND) -> u32 {
+        unsafe { GetWindowLongW(hwnd, GWL_STYLE) as u32 }
+    }
+
+    #[test]
+    fn rtf_signature_is_neutralized() {
+        for t in ["{\\rtf1 x}", "{\\urtf1 x}", "  \n{\\pwd x}", "{"] {
+            let n = neutralize_rtf_signature(t);
+            assert!(n.starts_with('\u{2060}') && n.ends_with(t), "{t:?}");
+        }
+        for t in ["", "plain", "a{\\rtf1}", "\\rtf1"] {
+            assert_eq!(neutralize_rtf_signature(t), t);
+        }
+    }
+
+    #[test]
+    fn create_configures_the_control() {
+        let _g = crate::testutil::richedit_lock();
+        assert!(load_library());
+        // a child window without a parent cannot be created
+        assert!(create(HWND::default(), 1, false).0.is_null());
+        let h = Host::new(false, 400, 300);
+        let e = h.edit;
+        assert_eq!(unsafe { GetDlgCtrlID(e) }, 7);
+        let st = style(e);
+        assert!(st & WS_CHILD.0 != 0 && st & WS_VSCROLL.0 != 0);
+        assert!(st & ES_MULTILINE as u32 != 0 && st & ES_READONLY as u32 == 0);
+        assert!(st & 0x0000_0008 != 0, "ES_NOOLEDRAGDROP");
+        assert!(st & 0x0000_2000 != 0, "ES_DISABLENOSCROLL");
+        // no URL auto-detection, no automatic keyboard/font switching, advanced typography, no 32K limit
+        assert_eq!(send(e, EM_GETAUTOURLDETECT, 0, 0), 0);
+        let lang = send(e, EM_GETLANGOPTIONS, 0, 0) as u32;
+        assert_eq!(lang & (IMF_AUTOKEYBOARD | IMF_AUTOFONT | IMF_DUALFONT | IMF_AUTOFONTSIZEADJUST), 0);
+        assert_ne!(send(e, EM_GETTYPOGRAPHYOPTIONS, 0, 0) as u32 & TO_ADVANCEDTYPOGRAPHY, 0);
+        assert_eq!(send(e, EM_GETLIMITTEXT, 0, 0), 0x7FFF_FFFE);
+        assert!(tom(e).is_some());
+        // read-only on creation and toggled later
+        let ro = create(h.parent, 8, true);
+        assert!(style(ro) & ES_READONLY as u32 != 0);
+        set_readonly(ro, false);
+        assert!(style(ro) & ES_READONLY as u32 == 0);
+        set_readonly(ro, true);
+        assert!(style(ro) & ES_READONLY as u32 != 0);
+    }
+
+    /// Document text is set and pasted only as plain text: an RTF signature stays literal.
+    #[test]
+    fn plain_text_is_never_parsed_as_rtf() {
+        let _g = crate::testutil::richedit_lock();
+        let h = Host::new(false, 400, 300);
+        let e = h.edit;
+        let rtf = "{\\rtf1\\ansi {\\field{\\*\\fldinst HYPERLINK \"x\"}{\\fldrslt y}}}";
+        set_plain_text(e, rtf);
+        assert_eq!(text(e), rtf);
+        assert_eq!(text_len(e), rtf.encode_utf16().count() as i32);
+        // line breaks are stored as '\r'; the undo history is cleared
+        set_plain_text(e, "a\nb\r\nc");
+        assert_eq!(text(e), "a\rb\rc");
+        assert_eq!(text_len(e), 5);
+        assert_eq!(send(e, EM_CANUNDO, 0, 0), 0);
+        // replacing the selection: plain, undoable, the caret ends after the inserted text
+        set_sel(e, 2, 3);
+        replace_sel(e, "{\\rtf1 X}", true);
+        assert_eq!(text(e), "a\r{\\rtf1 X}\rc");
+        assert_eq!(get_sel(e), (11, 11));
+        assert_ne!(send(e, EM_CANUNDO, 0, 0), 0);
+        set_plain_text(e, "");
+        assert_eq!((text(e).as_str(), text_len(e)), ("", 0));
+        // surrogate pairs count as two positions
+        set_plain_text(e, "😀x");
+        assert_eq!(text_len(e), 3);
+        assert_eq!(String::from_utf16_lossy(&get_range(e, 2, 3)), "x");
+    }
+
+    #[test]
+    fn ranges_lines_selection_and_search() {
+        let _g = crate::testutil::richedit_lock();
+        let h = Host::new(false, 400, 300);
+        let e = h.edit;
+        set_plain_text(e, "line one\nline TWO\nend");
+        let s = |v: Vec<u16>| String::from_utf16_lossy(&v);
+        assert_eq!(s(get_range(e, 5, 8)), "one");
+        assert!(get_range(e, 3, 3).is_empty() && get_range(e, 5, 2).is_empty());
+        set_sel(e, 9, 13);
+        assert_eq!(get_sel(e), (9, 13));
+        assert_eq!(s(get_selected_text(e)), "line");
+        set_sel(e, 4, 4);
+        assert!(get_selected_text(e).is_empty());
+        // lines
+        assert_eq!((line_from_char(e, 0), line_from_char(e, 10), line_from_char(e, 18)), (0, 1, 2));
+        assert_eq!((line_index(e, 0), line_index(e, 1), line_index(e, 2), line_index(e, 9)), (0, 9, 18, -1));
+        assert_eq!((line_length(e, 9), line_length(e, 19)), (8, 3));
+        // search: case, direction, start position, not found
+        assert_eq!(find_text(e, "two", 0, true, false), Some((14, 17)));
+        assert_eq!(find_text(e, "two", 0, true, true), None);
+        assert_eq!(find_text(e, "TWO", 0, true, true), Some((14, 17)));
+        assert_eq!(find_text(e, "line", 5, true, false), Some((9, 13)));
+        assert_eq!(find_text(e, "line", 21, false, false), Some((9, 13)));
+        assert_eq!(find_text(e, "line", 8, false, false), Some((0, 4)));
+        assert_eq!(find_text(e, "zzz", 0, true, false), None);
+        assert_eq!(find_text(e, "Привет", 0, true, false), None);
+    }
+
+    #[test]
+    fn rtf_loading_and_read_only_insert() {
+        let _g = crate::testutil::richedit_lock();
+        let h = Host::new(false, 400, 300);
+        let e = h.edit;
+        set_rtf(e, "{\\rtf1\\ansi Hello \\b bold\\b0}", false);
+        assert_eq!(text(e), "Hello bold");
+        set_sel(e, 0, 5);
+        set_rtf(e, "{\\rtf1\\ansi Bye}", true);
+        assert_eq!(text(e), "Bye bold");
+        // a writable control stays writable
+        assert!(insert_rtf(e, 0, "{\\rtf1\\ansi X}"));
+        assert!(text(e).starts_with("XBye"), "{:?}", text(e));
+        assert!(style(e) & ES_READONLY as u32 == 0);
+        // a read-only control is unlocked only for the insert
+        let ro = create(h.parent, 8, true);
+        assert!(insert_rtf(ro, 0, "{\\rtf1\\ansi one}"));
+        assert!(insert_rtf(ro, 3, "{\\rtf1\\ansi  two}"));
+        assert!(text(ro).starts_with("one two"), "{:?}", text(ro));
+        assert!(style(ro) & ES_READONLY as u32 != 0);
+    }
+
+    #[test]
+    fn view_helpers() {
+        let _g = crate::testutil::richedit_lock();
+        let (w, hh) = (500, 300);
+        let h = Host::new(false, w, hh);
+        let e = h.edit;
+        let body: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        set_plain_text(e, &body);
+        // zoom
+        assert_eq!(get_zoom(e), 100);
+        set_zoom(e, 150);
+        assert_eq!(get_zoom(e), 150);
+        set_zoom(e, 100);
+        assert_eq!(get_zoom(e), 100);
+        // background: EM_SETBKGNDCOLOR returns the previous color
+        set_bg(e, 0x0012_3456);
+        assert_eq!(send(e, EM_SETBKGNDCOLOR, 0, 0) as u32, 0x0012_3456);
+        // event mask: the previous mask is returned
+        assert_eq!(set_event_mask(e, ENM_CHANGE), 0);
+        assert_eq!(set_event_mask(e, 0), ENM_CHANGE);
+        // margins: top/bottom via the text rectangle, left/right via EM_SETMARGINS
+        set_margins(e, 20, 10, 30, 5);
+        let r = get_rect(e);
+        let mut client = RECT::default();
+        unsafe {
+            let _ = GetClientRect(e, &mut client);
+        }
+        assert!(client.right < w && client.bottom == hh, "the client area excludes the always-present scroll bar");
+        assert_eq!((r.left, r.top, r.right, r.bottom), (20, 10, client.right - 30, hh - 5));
+        set_margins(e, 20, 10, 30, 5);
+        assert_eq!(get_rect(e), r, "unchanged margins are a no-op");
+        set_margins(e, 40, 10, 30, 5);
+        assert_eq!(get_rect(e).left, 40, "only the left margin changed");
+        set_margins(e, 20, 10, 30, 5);
+        // scrolling
+        set_scroll_pos(e, 0, 200);
+        assert_eq!(scroll_pos(e).1, 200);
+        set_scroll_pos(e, 0, 0);
+        assert_eq!(scroll_pos(e), (0, 0));
+        // put a line at the top of the window, 8 px below the text rectangle top
+        let cp = line_index(e, 50);
+        scroll_scrollcaret_top(e, cp);
+        assert_eq!(get_sel(e), (cp, cp));
+        assert!(scroll_pos(e).1 > 0);
+        let (x, y) = pos_from_char(e, cp);
+        assert!((y - (r.top + 8)).abs() <= 2, "line 50 is at y={y}");
+        assert_eq!(char_from_pos(e, x + 1, y + 2), cp);
+        // scroll_caret brings the caret into view
+        set_scroll_pos(e, 0, 0);
+        let end = text_len(e);
+        set_sel(e, end, end);
+        scroll_caret(e);
+        assert!(scroll_pos(e).1 > 1000);
+    }
+
+    /// Without TOM (here: a plain EDIT control) the fallback path neutralizes an RTF signature.
+    #[test]
+    fn fallback_without_tom() {
+        let _g = crate::testutil::richedit_lock();
+        let class = wide("EDIT");
+        let edit = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                PCWSTR::from_raw(class.as_ptr()),
+                PCWSTR::null(),
+                WS_POPUP | WINDOW_STYLE(ES_MULTILINE as u32),
+                -4000,
+                -4000,
+                200,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        let read = || {
+            let mut buf = [0u16; 256];
+            let n = unsafe { GetWindowTextW(edit, &mut buf) } as usize;
+            String::from_utf16_lossy(&buf[..n])
+        };
+        assert!(tom(edit).is_none());
+        replace_sel(edit, "{\\rtf1 x}", true);
+        assert_eq!(read(), "\u{2060}{\\rtf1 x}");
+        assert_ne!(send(edit, EM_CANUNDO, 0, 0), 0);
+        // EM_SETTEXTEX is unknown to EDIT: the text stays, the undo history is cleared
+        set_plain_text(edit, "{\\rtf1 y}");
+        assert_eq!(read(), "\u{2060}{\\rtf1 x}");
+        assert_eq!(send(edit, EM_CANUNDO, 0, 0), 0);
+        unsafe {
+            let _ = DestroyWindow(edit);
+        }
+    }
 }

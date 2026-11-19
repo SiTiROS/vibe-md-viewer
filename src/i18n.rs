@@ -82,4 +82,26 @@ mod tests {
         assert_eq!(Lang::parse("RU"), Lang::Ru);
         assert_eq!(Lang::parse("de"), Lang::En);
     }
+
+    #[test]
+    fn lang_codes_and_parsing() {
+        assert_eq!(Lang::En.code(), "en");
+        assert_eq!(Lang::Ru.code(), "ru");
+        for l in [Lang::En, Lang::Ru] {
+            assert_eq!(Lang::parse(l.code()), l, "code round-trip");
+        }
+        for (s, l) in [("ru", Lang::Ru), (" Ru\t", Lang::Ru), ("rU", Lang::Ru), ("", Lang::En), ("en", Lang::En), ("russian", Lang::En), ("ру", Lang::En)] {
+            assert_eq!(Lang::parse(s), l, "{s:?}");
+        }
+    }
+
+    /// The macros take any expressions (not only literals for `tr!`) and positional arguments.
+    #[test]
+    fn macros_take_expressions() {
+        let en = String::from("Open");
+        assert_eq!(tr!(en.as_str(), "Открыть",), "Open");
+        assert_eq!(trf!("{} of {}", "{} из {}", 2, 5), "2 of 5");
+        assert_eq!(trf!("{x:>3}|", "{x:<3}|", x = 7), "  7|");
+        assert_eq!(trf!("plain", "просто"), "plain");
+    }
 }
