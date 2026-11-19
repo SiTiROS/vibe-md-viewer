@@ -103,7 +103,7 @@ cargo build --release         # target\release\vibe-md-viewer.exe
 powershell -ExecutionPolicy Bypass -File scripts\selftest.ps1 -Exe target\release\vibe-md-viewer.exe
 ```
 
-Подробно (кеши внутри папки проекта, замеры, пакет для раздачи) — [docs/BUILD.ru.md](docs/BUILD.ru.md). Каждый коммит проверяет [CI](.github/workflows/ci.yml): тесты, сборка, самотест на живом окне. Релиз собирается по тегу `vX.Y.Z` ([release.yml](.github/workflows/release.yml)).
+Подробно (кеши внутри папки проекта, замеры, пакет для раздачи) — [docs/BUILD.ru.md](docs/BUILD.ru.md). Каждый коммит проверяет [CI](.github/workflows/ci.yml): тесты, сборка, самотест на живом окне. Релиз публикуется автоматически, когда CI проходит на новой версии из `Cargo.toml` ([release.yml](.github/workflows/release.yml)).
 
 ## Документация
 

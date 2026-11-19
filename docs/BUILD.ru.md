@@ -57,8 +57,13 @@ powershell -ExecutionPolicy Bypass -File scripts\make-icon.ps1
 
 1. Поднять `version` в `Cargo.toml` (единственное место: версия попадает в свойства exe через `build.rs` и в логику обновления).
 2. Дописать раздел `## X.Y.Z — дата` в `CHANGELOG.md` (английский — он станет описанием релиза) и в `CHANGELOG.ru.md`.
-3. Закоммитить и поставить тег: `git tag vX.Y.Z` → `git push origin main vX.Y.Z`.
-4. GitHub Actions (`.github/workflows/release.yml`) проверит, что тег совпадает с версией, соберёт и протестирует (`scripts\package.ps1`, самотест), подпишет происхождение сборки и опубликует релиз: `vibe-md-viewer-X.Y.Z-setup.exe`, zip, контрольные суммы, `THIRD-PARTY-NOTICES.txt`.
+3. Закоммитить и отправить в `main`. Тег ставить не нужно.
+4. Релиз выходит автоматически. Когда CI на `main` проходит, GitHub Actions (`.github/workflows/release.yml`) проверяет, есть ли уже релиз версии из `Cargo.toml`. Если нет, то:
+   - собирает и тестирует именно этот коммит (`scripts\package.ps1`, самотест);
+   - подписывает происхождение сборки;
+   - публикует релиз `vX.Y.Z` (тег создаётся на этом коммите) с `vibe-md-viewer-X.Y.Z-setup.exe`, zip, контрольными суммами и `THIRD-PARTY-NOTICES.txt`.
+
+   Коммиты без смены версии релизов не создают. Запустить вручную: Actions → Release → Run workflow.
 
 Локально то же самое — `scripts\package.ps1` → `dist\`.
 

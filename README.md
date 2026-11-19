@@ -103,7 +103,7 @@ cargo build --release         # target\release\vibe-md-viewer.exe
 powershell -ExecutionPolicy Bypass -File scripts\selftest.ps1 -Exe target\release\vibe-md-viewer.exe
 ```
 
-Details (caches inside the project folder, measurements, distribution package) — [docs/BUILD.md](docs/BUILD.md). Every commit is checked by [CI](.github/workflows/ci.yml): tests, build, self-test on a live window. Releases are built from a `vX.Y.Z` tag ([release.yml](.github/workflows/release.yml)).
+Details (caches inside the project folder, measurements, distribution package) — [docs/BUILD.md](docs/BUILD.md). Every commit is checked by [CI](.github/workflows/ci.yml): tests, build, self-test on a live window. A release is published automatically when CI passes on a new version in `Cargo.toml` ([release.yml](.github/workflows/release.yml)).
 
 ## Documentation
 

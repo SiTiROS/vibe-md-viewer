@@ -49,4 +49,4 @@ powershell -ExecutionPolicy Bypass -File scripts\bench.ps1 -Exe target\release\v
 
 ## Releases
 
-Bump `version` in `Cargo.toml`, add the section to both changelogs, tag `vX.Y.Z`. GitHub Actions builds, tests, attests and publishes the release (`.github/workflows/release.yml`). Actions are official `actions/*` only, pinned by commit SHA.
+Bump `version` in `Cargo.toml`, add the section to both changelogs, push to `main`. When CI passes and that version has no release yet, GitHub Actions builds, tests, attests and publishes the release `vX.Y.Z` (`.github/workflows/release.yml`); the tag is created on the checked commit. A commit without a version bump releases nothing. Actions are official `actions/*` only, pinned by commit SHA.

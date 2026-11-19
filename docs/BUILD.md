@@ -57,8 +57,13 @@ powershell -ExecutionPolicy Bypass -File scripts\make-icon.ps1
 
 1. Bump `version` in `Cargo.toml` (the only place: the version goes into the exe properties via `build.rs` and into the update logic).
 2. Add a `## X.Y.Z — date` section to `CHANGELOG.md` (it becomes the release description) and to `CHANGELOG.ru.md`.
-3. Commit and tag: `git tag vX.Y.Z` → `git push origin main vX.Y.Z`.
-4. GitHub Actions (`.github/workflows/release.yml`) checks that the tag matches the version, builds and tests (`scripts\package.ps1`, self-test), signs the build provenance, and publishes the release: `vibe-md-viewer-X.Y.Z-setup.exe`, zip, checksums, `THIRD-PARTY-NOTICES.txt`.
+3. Commit and push to `main`. No tag needed.
+4. The release is automatic. When CI passes on `main`, GitHub Actions (`.github/workflows/release.yml`) checks whether the version from `Cargo.toml` already has a release. If not, it:
+   - builds and tests that very commit (`scripts\package.ps1`, self-test);
+   - signs the build provenance;
+   - publishes the release `vX.Y.Z` (the tag is created on that commit) with `vibe-md-viewer-X.Y.Z-setup.exe`, the zip, checksums and `THIRD-PARTY-NOTICES.txt`.
+
+   Commits without a version bump don't release anything. A manual re-run: Actions → Release → Run workflow.
 
 Locally the same — `scripts\package.ps1` → `dist\`.
 

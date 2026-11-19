@@ -40,7 +40,7 @@
 
 ### Open source
 - MIT license; licenses of the libraries included in the program — `THIRD-PARTY-NOTICES.txt` (`scripts\notices.ps1`), shipped in the zip and the release.
-- GitHub Actions: every commit — unit tests, build, self-test on a live window; a `vX.Y.Z` tag — the installer is built from the tagged sources and released with checksums and a description from the CHANGELOG. Only official `actions/*` actions.
+- GitHub Actions: every commit gets unit tests, a build and a self-test on a live window. When CI passes on a new version in `Cargo.toml`, the release follows automatically: the installer is built from that commit and published as `vX.Y.Z` with checksums and a description from the CHANGELOG. Only official `actions/*` actions.
 - The test document with inline `code` was replaced with a fictional one.
 
 ### Security (independent audit before publishing)
